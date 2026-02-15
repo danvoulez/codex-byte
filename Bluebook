@@ -1,0 +1,3294 @@
+Bluebook
+
+UBL
+
+**Capítulo 1/12** — o coração do sistema: núcleo imutável, contrato estável e “receipt-first” ponta-a-ponta.
+
+1/12 · Núcleo Imutável & Contrato Estável (Receipt-First)
+=========================================================
+
+Objetivo do capítulo
+--------------------
+
+Estabelecer os **invariantes** que tornam o sistema confiável: tudo que entra no Gate executa `parse → policy → receipt` de forma determinística; nada “novo” é carregado em runtime; o resultado **sempre** é um **Receipt** verificável (CID + assinatura). Também definimos **rotas canônicas com escopo**, **modelo de erro único**, **tipos Rust estáveis** e um **kit de testes de contrato**.
+
+* * *
+
+Invariantes (“leis”) do núcleo
+------------------------------
+
+1.  **Código estático, runtime fechado**
+    *   Binários `--locked`, sem `unsafe`.
+    *   Política em **packs estáticos** (feature flags), sem carregamento dinâmico.
+2.  **Determinismo observável**
+    *   Mesma entrada canônica ⇒ mesmo CID ⇒ mesmo Receipt.
+    *   Sem IO no caminho da decisão (sem rede/relógio/thread própria).
+3.  **Receipt-First**
+    *   Toda operação retorna um Receipt (WA/TR/WF).
+    *   O **payload bruto nunca** sai do Gate; só artefatos verificados.
+4.  **Escopo em primeiro lugar**
+    *   Toda chave de dados é `app:tenant:cid`. Nada “flutua” fora do escopo.
+5.  **Erros padronizados**
+    *   Uma única estrutura de erro (`AppError`) em JSON, com `code`, `message`, `request_id`, `retry_after`.
+
+* * *
+
+Contrato HTTP (rotas canônicas + legado)
+----------------------------------------
+
+### Padrão canônico (recomendado)
+
+```
+/a/{app}/t/{tenant}/v1/execute
+/a/{app}/t/{tenant}/v1/receipt/{cid}
+/a/{app}/t/{tenant}/v1/receipts
+/a/{app}/t/{tenant}/v1/audit
+/a/{app}/t/{tenant}/v1/transition/{cid}
+```
+
+### Legado (mapeia para `default:default`)
+
+```
+/v1/execute
+/v1/receipt/{cid}
+/v1/receipts
+/v1/audit
+/v1/transition/{cid}
+```
+
+**Observações importantes**
+
+*   `{cid}` aceita `b3:` com `:` literal ou `%3A`.
+*   `GET` **não** exige `Content-Type`.
+*   Cabeçalhos de CORS e Rate Limit devidamente expostos (ver Cap. 3/12 e 5/12).
+
+* * *
+
+Modelo de erro único (JSON)
+---------------------------
+
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "receipt not found",
+    "request_id": "req_01HZW5…",
+    "retry_after": 0
+  }
+}
+```
+
+*   Erros 4xx/5xx **sempre** nesse formato.
+*   `request_id` ajuda rastreio; `retry_after` em segundos (0 se não aplicável).
+
+* * *
+
+Tipos Rust estáveis (núcleo mínimo)
+-----------------------------------
+
+> Estes tipos vivem num crate central (ex.: `ubl_core`) e raramente mudam (SemVer estrito).
+
+```rust
+// scope.rs
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Scope { pub app: String, pub tenant: String }
+impl Scope {
+    pub fn new<A: Into<String>, T: Into<String>>(app: A, tenant: T) -> Self {
+        Self { app: app.into(), tenant: tenant.into() }
+    }
+    pub fn key_prefix(&self) -> String { format!("a/{}/t/{}/", self.app, self.tenant) }
+    pub fn scoped_cid<S: AsRef<str>>(&self, cid: S) -> String {
+        format!("{}{}", self.key_prefix(), cid.as_ref())
+    }
+}
+
+// receipt.rs
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase { Wa, Transition, Wf }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Decision { Pass, Retry, Deny }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ReceiptV1 {
+    pub scope: Scope,
+    pub phase: Phase,
+    /// CID canônico do corpo (NRF). Ex.: "b3:abc…"
+    pub body_cid: String,
+    /// DID do runtime + fingerprint do binário (opcional)
+    pub runtime_did: String,
+    pub runtime_sha256: Option<String>,
+    /// Envelopes e encadeamentos
+    pub jws_alg: String,           // "Ed25519"
+    pub jws_kid: String,           // ex.: DID
+    pub jws_payload_hex: String,   // payload canônico (TLV/NRF) hex
+    pub parent_cid: Option<String>,// encadeamento WA→TR→WF
+    pub decision: Decision,        // apenas em WF
+    pub ts_ms: i64                 // timestamp injetado pelo Gate (host)
+}
+```
+
+* * *
+
+Política estática (packs)
+-------------------------
+
+```rust
+#[async_trait::async_trait]
+pub trait Policy: Send + Sync {
+    fn id(&self) -> &'static str; // ex.: "aml:v1", "pipl:v1"
+    async fn decide(&self, ctx: &PolicyCtx) -> anyhow::Result<Decision>;
+}
+
+pub struct PolicyCtx<'a> {
+    pub scope: &'a Scope,
+    pub nrf: &'a serde_json::Value, // gramática já canônica
+    pub hint: &'a PolicyHints        // sinalizações do pipeline
+}
+```
+
+*   Lista de políticas definida no `main()` do Gate, em ordem.
+*   Primeira política ≠ `PASS` **encerra** a cadeia (curto-circuito).
+*   Sem IO, sem locks de longa duração, sem acesso a clock.
+
+* * *
+
+Execução Receipt-First (linha do tempo)
+---------------------------------------
+
+1.  **WA**: materializa intenção “fantasma” (antes da execução), CID gerado.
+2.  **Transition**: prova de salto RB→ρ (VM/pipeline canônicos), CID gerado.
+3.  **WF**: decisão final (PASS/RETRY/DENY).
+4.  **Persistência**: cada fase persiste no ledger **escopado** (`a/{app}/t/{tenant}/`).
+5.  **Evento**: publicar `ReceiptEvent` (Cap. 6/12) após persistência (at-least-once).
+
+* * *
+
+Regras de CORS (alto nível, detalhes no Cap. 3/12)
+--------------------------------------------------
+
+*   `AllowOrigin::predicate` resolve `Scope` **a partir do path**, inclusive **pré-flight**.
+*   Ordem de resolução: `(app,tenant)` → `(app,*)` → `global`.
+*   Sem dependência de autenticação para decidir CORS.
+
+* * *
+
+Idempotência e Rate Limit (alto nível)
+--------------------------------------
+
+*   **Idempotência** por `(app,tenant,method,path,idemp_key)` + `body_sha` (LRU+TTL).
+*   **Rate Limit** por `(app,tenant,client_id)` com headers expostos no CORS.
+*   Casos “Replay/Progress/Expired/Evict” cobertos por testes (Cap. 5/12).
+
+* * *
+
+Contrato de verificação (CLI e UI)
+----------------------------------
+
+*   CLI `ublx verify` deve aceitar: `--cid`, `--did`, `--payload`, `--sig`.
+*   UI exibe **motivos para confiar** e guia “como verificar” (sem expor payload).
+*   “Copy All” inclui `links.self` para deep-link verificável.
+
+* * *
+
+Kit de testes de contrato (mínimo indispensável)
+------------------------------------------------
+
+1.  **Roteamento `{cid}` (b3:)**
+    *   `GET /a/app/t/ten/v1/receipt/b3:…` ⇒ 200 | 404 JSON
+    *   Aceita `b3:%3A…` idem.
+    *   `Content-Type` ignorado em `GET`.
+2.  **Escopo**
+    *   `execute` em `A:X` não aparece em `A:Y` nem em `B:*`.
+    *   `receipts` e `audit` retornam apenas chaves `app:tenant:cid`.
+3.  **Determinismo**
+    *   Mesma entrada canônica ⇒ mesmo CID/Receipt (10x).
+    *   `ghost:true` evita colisão de idempotência na prova.
+4.  **Políticas**
+    *   `PASS` por padrão; regras simples gerando `RETRY` e `DENY`.
+    *   Curto-circuito garantido (primeira decisão finaliza).
+5.  **Erros**
+    *   401/403/404/429/5xx retornam `AppError` JSON.
+    *   `request_id` sempre presente.
+6.  **CORS**
+    *   Preflight com `Origin` permitido no `(app,tenant)` e fallback `(app,*)`/global.
+    *   `Vary` correto.
+7.  **Idempotência & Rate**
+    *   `Replay` com mesmo `Idempotency-Key`.
+    *   Limites isolados por escopo.
+
+* * *
+
+Exemplos de payloads (simplificados)
+------------------------------------
+
+### `POST /a/acme/t/pro/v1/execute`
+
+```json
+{
+  "manifest": {
+    "pipeline": "doc-officialize",
+    "in_grammar": {"inputs":{"doc":""},"mappings":[],"output_from":"doc"},
+    "out_grammar":{"inputs":{"doc":""},"mappings":[],"output_from":"doc"},
+    "policy": {"allow": true}
+  },
+  "vars": {"doc": "Proposta v1"},
+  "options": {"ghost": true}
+}
+```
+
+### `200 OK` (WF)
+
+```json
+{
+  "decision": "PASS",
+  "tip_cid": "b3:f749…8ae0",
+  "links": {
+    "self": "https://gate/a/acme/t/pro/v1/receipt/b3:f749…8ae0",
+    "verify": "https://gate/a/acme/t/pro/v1/verify/b3:f749…8ae0"
+  },
+  "runtime": { "did": "did:key:z6Mk…", "sha256": "9c5e…"},
+  "policy_trace": [{"id":"allow-all:v1","decision":"PASS"}]
+}
+```
+
+* * *
+
+Checklist de implantação segura (Gate)
+--------------------------------------
+
+*    Compilar com `--release --locked` e registrar `sha256` em metadata.
+*    Ativar **auth** por padrão (dev token mapeado para `default:default`).
+*    CORS por escopo habilitado (predicate lendo path).
+*    Idempotência LRU+TTL e Rate Limit `(app,tenant,client)` ativos.
+*    Métricas Prometheus e tracing com spans essenciais.
+*    EventBus configurado (publicação após persistência).
+
+* * *
+
+Saída esperada deste capítulo
+-----------------------------
+
+*   Crate `ubl_core` com **Scope**, **ReceiptV1**, **Policy** e **AppError**.
+*   Rotas `{cid}` migradas para `{}` (Axum 0.7) e legado mapeado para `default:default`.
+*   Middleware de CORS (predicate com escopo), Idempotência, Rate Limit ligados.
+*   Testes de contrato mínimos rodando em CI.
+
+* * *
+
+No próximo capítulo (**2/12 · Persistência & Ledger**) eu fecho o desenho de **armazenamento imutável**, index de chaves `app:tenant:cid`, migração “legacy → scoped”, e preparo a base para o **EventBus** (cap. 6/12). Quer que eu siga direto?
+
+## Prompt:
+2
+
+## Response:
+Aqui vai o **Capítulo 2/12** — **Persistência Imutável, Ledger & Índices**. Bora “assentar o chão” para escalar com segurança, mantendo o modelo receipt-first impecável. 🚀
+
+2/12 · Persistência & Ledger (CAS, escopo forte, migração e testes)
+===================================================================
+
+Objetivo do capítulo
+--------------------
+
+Definir como cada artefato do pipeline é **persistido de forma imutável**, com **namespace por escopo (`app:tenant`)**, garantindo **reprodutibilidade, recuperação** e **indexação** eficientes. Também cobrimos migração do modo legado, políticas de retenção/GC e testes de integridade.
+
+* * *
+
+1) Modelo de dados: “tudo é um chip”
+------------------------------------
+
+Princípio: todo artefato persistido é **conteúdo-endereçado** por **CID** (BLAKE3 multibase). O _escopo_ é parte do endereço lógico para isolar dados por **{app, tenant}**.
+
+### Tipos de artefato
+
+*   **NRF (payload canônico)**: entrada e saídas canônicas em TLV/JSON canônico.
+*   **Receipt**: WA / Transition / WF, contendo encadeamento, `runtime_sha256`, `jws`, etc.
+*   **Transition proof**: evidências do salto RB→ρ (separado ou incluso no receipt).
+*   **Runtime release**: metadados do binário certificado (DID + SHA-256).
+*   **Índices auxiliares**: chaves compactas para listagens, buscas e auditoria.
+
+* * *
+
+2) Layout do Ledger (S3-compat, ex.: Garage)
+--------------------------------------------
+
+Armazenamos em um bucket único (p.ex. `ubl-ledger`) usando **paths determinísticos**:
+
+```
+a/{app}/t/{tenant}/
+  nrf/
+    {cid}                          # conteúdo canônico (NRF)
+  receipt/
+    wa/{cid}.json                  # recibos WA
+    tr/{cid}.json                  # recibos Transition
+    wf/{cid}.json                  # recibos WF (decisão)
+  trans/
+    {cid}.proof.json               # (opcional) provas de transição
+  runtime/
+    {runtime_sha256}.json          # manifesto do runtime certificado
+  index/
+    by-time/{YYYY}/{MM}/{DD}/{HH}/{cid}.idx   # para varreduras temporais
+    by-decision/{PASS|RETRY|DENY}/{cid}.idx   # atalhos de auditoria
+    heads/{cid}.idx                 # “pontos de ponta” (WF) do encadeamento
+```
+
+**Observações**
+
+*   O **CID** é calculado sobre o conteúdo canônico. Para recibos, usamos **CID do corpo (body\_cid)** do próprio receipt JSON **normalizado**.
+*   O _escopo_ (app/tenant) não altera o CID (imutabilidade global), mas define **onde** o artefato mora e **quem** enxerga.
+
+* * *
+
+3) Chaves de leitura/escrita (escopo forte)
+-------------------------------------------
+
+No Gate, toda operação resolve um `Scope`:
+
+```rust
+let key = scope.scoped_cid(cid); // "a/{app}/t/{tenant}/" + cid
+```
+
+*   **Escrita**: sempre para o _namespace_ do escopo.
+*   **Leitura**: primeiro no namespace do escopo; jamais “vazar” para outro escopo.
+*   **Legado**: `/v1/*` mapeia para `default:default` (cap. 1/12). Usado somente como compat.
+
+* * *
+
+4) Fluxo de persistência receipt-first
+--------------------------------------
+
+1.  **WA** (intenção “fantasma”)
+    *   Persiste `nrf/{wa_body_cid}` + `receipt/wa/{wa_body_cid}.json`
+    *   Publica índice temporal `index/by-time/.../wa_body_cid.idx`
+2.  **Transition**
+    *   Persiste `receipt/tr/{tr_body_cid}.json` (+ `trans/{tr_body_cid}.proof.json` se existir)
+    *   Atualiza `index/by-time` (+ opcional `by-decision` se sua política já marca algo)
+3.  **WF** (decisão final)
+    *   Persiste `receipt/wf/{wf_body_cid}.json`
+    *   Atualiza `index/by-decision/{decision}/{wf_body_cid}.idx`
+    *   Marca “head” do encadeamento: `index/heads/{wf_body_cid}.idx`
+
+> **Regra**: publicar eventos (EventBus) **depois** que a escrita persistente retornar `OK` (at-least-once).
+
+* * *
+
+5) Índices & consultas
+----------------------
+
+Os índices são **arquivos vazios ou JSON mínimo** (baratos), usados como _ponteiros_:
+
+*   `index/by-time/…/{cid}.idx` → lista por janela de tempo.
+*   `index/by-decision/PASS/{cid}.idx` → auditorias rápidas de conformidade.
+*   `index/heads/{wf_cid}.idx` → facilitar `GET /receipt/{cid}` e paginações de “últimos WF”.
+
+### Consulta típica
+
+*   **GET último WF do app/tenant nas últimas N horas**:
+    1.  "expandir" `index/by-time/YYYY/MM/DD/HH` dentro da janela
+    2.  ordenar por nome de arquivo (ou por metadata S3) desc
+    3.  bater em `index/heads/…` para garantir que é “ponta”
+    4.  retornar a lista de `cid` → carregar `receipt/wf/{cid}.json`
+
+* * *
+
+6) Migração “Legado → Scoped”
+-----------------------------
+
+Para repos que hoje guardam em memória ou em `default:default`:
+
+1.  **Backfill** (offline)
+    *   Ler `receipts` antigos do armazenamento anterior (ou memória/dump).
+    *   Para cada receipt, **recomputar** `body_cid` (confirma integridade).
+    *   **Escrever** nos novos paths em `a/{app}/t/{tenant}/...` (usa mapa `cid → scope` conforme origem).
+    *   Gerar índices `by-time`, `by-decision`, `heads`.
+2.  **Sinalização** (feature flag rollout)
+    *   Gate passa a usar **somente** o armazenamento scoped para escrita/leitura.
+    *   Rotas legadas continuam resolvendo `default:default` somente se ativado.
+3.  **Verificação**
+    *   Rodar **provas determinísticas**: para amostras, fazer `GET` antigo vs novo e garantir `cid` e `decision` iguais.
+    *   Auditoria de amostragem `N%` com hash de conteúdo.
+
+* * *
+
+7) Integridade & segurança
+--------------------------
+
+*   **WAL local** (Write-Ahead Log): opcional, para aumentar robustez em queda de energia/rede; flush assíncrono para S3.
+*   **Digest duplo**: armazenar `sha256` do Receipt no metadata do objeto S3 (`x-amz-meta-sha256`) facilita checagem rápida.
+*   **Assinatura JWS**: o campo `jws` do Receipt cobre o payload canônico. Verificação é offline, sem depender do S3.
+*   **Server-side encryption**:
+    *   Se Garage suportar SSE nativa, habilitar; senão, **envelopes** de criptografia por objeto (KMS externo ou chave de tenant).
+*   **Retention / WORM**:
+    *   Políticas de bucket (S3 Object Lock) para imutabilidade de X dias/meses em ambientes regulados.
+*   **Versionamento**:
+    *   Ativar versionamento do bucket (barato, útil contra deleção acidental).
+*   **ACLs & IAM**:
+    *   Gate usa **credencial única** com permissão _apenas_ ao prefixo `a/{app}/t/{tenant}/…` quando for multi-tenant por credencial; em single-tenant, compartilha mas nunca expõe credencial ao cliente.
+
+* * *
+
+8) GC, retenção e _pinning_
+---------------------------
+
+*   **Receipts**: por padrão **não** sofrem GC (prova histórica).
+*   **NRF**: elegível a GC quando:
+    *   Não referenciado por nenhum Receipt “vivo” (contabilidade via referência reversa opcional).
+    *   Políticas de retenção do tenant (ex.: “descartar NRF WA após 90 dias”).
+*   **Pinning**:
+    *   `a/{app}/t/{tenant}/pin/{cid}` (arquivo vazio) indica **não GC**.
+    *   Consumidores (indexer) podem “pin” para reprocessar ou manter projeções.
+
+* * *
+
+9) Desempenho & custos
+----------------------
+
+*   **Batch**: uploads em lote (multi-part) para recibos grandes (raros).
+*   **Compressão**: `Content-Encoding: zstd` para NRFs grandes (se cliente/infra permitir) ou compressão transparente no SDK (sem alterar CID do _conteúdo canônico_).
+*   **Hot storage vs Cold**:
+    *   Receipts WF recentes em _hot tier_; WA/TR e NRF antigos podem ir para _cold tier_.
+*   **Índices finos**:
+    *   Pequenos, baratos e majoritariamente “append-only”; evitamos _tables_ complexas.
+
+* * *
+
+10) Testes de persistência (contrato)
+-------------------------------------
+
+### Unidade
+
+*   `cid_is_stable_for_same_content`
+*   `scoped_key_prefix_is_correct`
+*   `receipt_roundtrip_json_is_canonical`
+*   `index_paths_are_deterministic`
+
+### Integração (com S3 local)
+
+*   `put_nrf_then_receipts_wa_tr_wf → list_by_time_contains_all`
+*   `get_wf_by_cid_returns_complete_trace`
+*   `legacy_path_maps_to_default_scope_only_when_enabled`
+*   `sse_and_metadata_digest_present` (se SSE habilitada)
+*   `worm_retention_blocks_delete` (se objeto travado)
+
+### E2E (via Gate)
+
+*   `execute → three receipts persisted → wf head visible`
+*   `multi-tenant_isolation_on_keys_and_lists`
+*   `migration_backfill_keeps_cids`
+*   `event_published_only_after_persist_ok` (ver cap. 6/12)
+
+* * *
+
+11) Operação & observabilidade
+------------------------------
+
+*   **Métricas**
+    *   `ledger_put_seconds{kind="nrf|wa|tr|wf"}`
+    *   `ledger_errors_total{stage=...}`
+    *   `ledger_bytes_written_total`
+    *   `index_write_seconds`
+*   **Tracing**
+    *   spans: `ledger.put`, `ledger.get`, `index.write`, `index.scan`, com `cid`, `scope` e `bytes`.
+*   **Alertas**
+    *   P95/99 de `ledger.put_seconds`
+    *   Taxa de erro por estágio (WA/TR/WF)
+    *   “Out of order” (evento sem persistência) → **não deve ocorrer**
+
+* * *
+
+12) APIs administrativas (CLI/SDK)
+----------------------------------
+
+*   `ublx ledger put-nrf --file f.json --scope a:tenant`
+*   `ublx ledger get-receipt --cid b3:… --scope …`
+*   `ublx ledger list --by-time --from -24h --scope …`
+*   `ublx ledger verify-receipt --cid b3:…` (bate `sha256`, `jws`, `runtime_sha256`)
+*   `ublx migrate backfill --from dump.ndjson --scope-map map.json`
+
+> A **UI futura** consome as mesmas rotas ou shell out para `ublx` (mirror), mantendo coerência (cap. 1/12).
+
+* * *
+
+13) Plano de migração seguro (passo-a-passo)
+--------------------------------------------
+
+1.  **Read-only mirror**: habilitar leitura do novo ledger em paralelo (feature flag).
+2.  **Dual-write**: Gate grava no **scoped** e no legado (somente por curto período).
+3.  **Verificação**: amostragem diária de recibos (`N%`) comparando CIDs/decisões.
+4.  **Cutover**: desligar escrita no legado; manter leitura de emergência por X dias.
+5.  **Arquivamento**: snapshot do legado; documentação de “rollback steps”.
+6.  **GC legado**: após retenção mínima, apagar.
+
+* * *
+
+14) Riscos & mitigação
+----------------------
+
+*   **Divergência canônica** (lib de JSON/TLV muda):  
+    → “Golden tests” versionados; _pin_ de versões; `runtime_sha256` no receipt.
+*   **Clock do host** influencia `ts_ms`:  
+    → `ts_ms` é **metadado**, não entra no CID do corpo canônico.
+*   **S3 eventual** impacta lista imediata:  
+    → Index `by-time` gravado de forma consistente antes do publish de evento.
+*   **Chaves IAM muito amplas**:  
+    → Minimizar escopo via prefix; auditorias automáticas de políticas.
+
+* * *
+
+15) Saídas deste capítulo
+-------------------------
+
+*   Layout do bucket e funções de utilidade implementadas (put/get/list por escopo).
+*   Escrita WA/TR/WF + índices `by-time`, `by-decision`, `heads`.
+*   CLI/SDK para verificação e backfill.
+*   Testes de unidade/integração/E2E rodando no CI.
+*   Guia de migração aplicado em _dev_ e _staging_.
+
+* * *
+
+Se estiver ok, sigo com o **Capítulo 3/12 – CORS, Autenticação e Rate/Idempotência**: predicate consciente de **path/escopo**, preflight correto sem auth, headers expostos e testes de ataque (origem inválida, wildcard tightening). Quer que eu avance?
+
+## Prompt:
+3
+
+## Response:
+Aqui vai o **Capítulo 3/12 — CORS, Autenticação e Defesa de Perímetro**. Foco: **predicate CORS consciente de escopo**, **preflight sem atrito**, **AuthN/AuthZ por Scope**, **Rate Limit + Idempotência** coerentes com o modelo _receipt-first_.
+
+3/12 · CORS, Auth e Perímetro (Scope-aware, testável e mínimo)
+==============================================================
+
+Objetivo do capítulo
+--------------------
+
+1.  Tornar o **CORS determinístico por escopo** (`app`, `tenant`) e seguro em **preflight**.
+2.  Consolidar **AuthN/AuthZ** no Gate, extraindo **Scope** do path e dos **tokens**.
+3.  Unificar **Rate Limiter** e **Idempotência** com _keys_ escopo-aware e sem falso positivo.
+4.  Entregar **testes de ataque** e **contratos de erro JSON**.
+
+* * *
+
+1) Predicado CORS “Scope-aware”
+-------------------------------
+
+### 1.1 Escopo no path
+
+Rotas “novas” (escopadas):
+
+```
+/a/{app}/t/{tenant}/v1/execute
+/a/{app}/t/{tenant}/v1/receipt/{cid}
+/a/{app}/t/{tenant}/v1/receipts
+```
+
+Fallback legado (mapeia p/ `default:default`): `/v1/*`.
+
+### 1.2 Modelo de configuração
+
+```rust
+/// Config hierárquica: (app, tenant) → (app, *) → global
+pub struct CorsConfig {
+    pub global_allowed: Vec<String>,
+    pub app_allowed: HashMap<String, Vec<String>>,
+    pub app_tenant_allowed: HashMap<(String,String), Vec<String>>,
+}
+
+impl CorsConfig {
+    pub fn is_origin_allowed(&self, origin: &str, scope: Option<&Scope>) -> bool {
+        if let Some(s) = scope {
+            if let Some(list) = self.app_tenant_allowed.get(&(s.app.clone(), s.tenant.clone())) {
+                return list.iter().any(|o| o == origin);
+            }
+            if let Some(list) = self.app_allowed.get(&s.app) {
+                return list.iter().any(|o| o == origin);
+            }
+        }
+        self.global_allowed.iter().any(|o| o == origin)
+    }
+}
+```
+
+### 1.3 Predicado AllowOrigin
+
+*   **Para requests normais** (GET/POST…): resolve `Scope` do path e avalia `Origin`.
+*   **Para preflight (OPTIONS)**: extrai o mesmo **Scope do path** (sem depender de Auth) e avalia `Origin`.
+*   **Headers expostos** (ex.: `x-ratelimit-*`, `retry-after`) definidos uma única vez.
+
+Pseudocódigo no _builder_ do Axum:
+
+```rust
+let cors = CorsLayer::new()
+  .allow_origin(AllowOrigin::predicate(move |origin, req_parts| {
+      let origin = match origin.to_str() { Ok(s) => s, Err(_) => return false };
+      // resolve escopo a partir do path, inclusive em OPTIONS
+      let scope = parse_scope_from_path(req_parts.uri.path());
+      state.cors_config.is_origin_allowed(origin, scope.as_ref())
+  }))
+  .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+  .allow_headers([CONTENT_TYPE, AUTHORIZATION])
+  .expose_headers(["x-ratelimit-limit","x-ratelimit-remaining","retry-after"]);
+```
+
+### 1.4 Preflight: regras
+
+*   **Nunca exigir Auth** no **OPTIONS** preflight.
+*   **Responder 204** rápido quando `Origin` e `Access-Control-Request-Method` forem válidos para o escopo.
+*   **Negar (403)** com JSON consistente quando inválido (evitar `text/plain`).
+
+* * *
+
+2) AuthN/AuthZ coesas com Scope
+-------------------------------
+
+### 2.1 Tokens e Scope
+
+*   **AuthN**: `Authorization: Bearer <token>`.
+*   **ClientInfo** decodificado → `client_id`, `app`, `tenants[]`, `roles[]`, _ttl_.
+*   **Scope do path** é **fonte de verdade**; o token precisa **autorizar** aquele par `(app, tenant)`.
+
+Regra:
+
+*   Se **Scope** do path ≠ um dos escopos do token → **403** `{"code":"forbidden_scope",...}`.
+*   No **legado** (`/v1/*`), usar `default:default` e aplicar as mesmas regras.
+
+### 2.2 Modo convite (cap. de onboarding virá adiante)
+
+*   **Convite por e-mail** gera _claim_ temporária (JWS) que amarra `user_email → {app,tenant,roles}`.
+*   Se o usuário já está autenticado ao aceitar, **não** pedir códigos: basta **aceite**.
+
+### 2.3 Erros padronizados (JSON)
+
+Criar `AppError` único:
+
+```json
+{ "code": "forbidden_scope", "message": "Token not allowed for scope a:X/t:Y", "request_id":"...", "retry_after":0 }
+```
+
+Outros códigos: `unauthorized`, `cors_denied`, `rate_limited`, `idempotent_replay`, `invalid_cid`, `not_found`.
+
+* * *
+
+3) Rate Limiting e Idempotência (defesa dupla)
+----------------------------------------------
+
+### 3.1 Chaves “Scope-aware”
+
+*   **Rate limit key**: `rl:{app}:{tenant}:{client_id}:{method}:{path}`
+*   **Idempotency key**: `idem:{app}:{tenant}:{method}:{path}:{idempotency_key}` + **hash(body)**.
+
+### 3.2 Política de Rate
+
+*   **Janela deslizante** por `(app, tenant, client)`; limites configuráveis por plano.
+*   **Headers**:
+    *   `x-ratelimit-limit`, `x-ratelimit-remaining`.
+    *   `retry-after` para bloqueios.
+*   **Escalada**: _burst_ pequeno + média por janela → reduz falsos positivos.
+
+### 3.3 Idempotência
+
+*   **POST** exige header opcional `Idempotency-Key` (recomendado para clientes).
+*   Armazenar **(hash do corpo, status, wf\_cid, expiração)**.
+*   Replays com **mesmo key** e **mesmo hash** → **200** com mesmo resultado; **hash diferente** → **409**.
+*   TTL curto (ex.: 10–30 min) com **LRU + monotonic seq** para desempate determinístico (evita flakiness de `Instant`).
+
+* * *
+
+4) Fluxos de preflight e execução
+---------------------------------
+
+### 4.1 Preflight (CORS)
+
+1.  **OPTIONS** `/a/x/t/y/v1/execute` + headers CORS.
+2.  Predicado extrai `{x,y}`, checa `Origin` contra `CorsConfig`.
+3.  Se ok → **204** com `Access-Control-Allow-*`; senão **403 JSON**.
+
+### 4.2 Execução autenticada
+
+1.  **POST** com Bearer.
+2.  Middleware Auth resolve `ClientInfo` e valida `Scope`.
+3.  **Idempotency** (se presente) → early return se replay.
+4.  **Rate limit**.
+5.  **Runtime** (determinístico) → gera WA/TR/WF.
+6.  **Persistência** (cap. 2/12), **publish** (cap. 6/12).
+7.  **Resposta**: WF Receipt + headers de cota.
+
+* * *
+
+5) Testes (ataque, unidade, integração, E2E)
+--------------------------------------------
+
+### 5.1 CORS
+
+*   **Preflight válido**: `Origin` permitido por `(app,tenant)` → 204 + allow headers.
+*   **Preflight inválido**: `Origin` não permitido → 403 JSON `cors_denied`.
+*   **Request sem `Origin`** (curl/backend) → permitido (CORS só p/ browsers).
+*   **Wildcard tightening**: garantir que `*` **não** cobre endpoints **autenticados**; exigir lista explícita.
+
+### 5.2 Auth
+
+*   **Bearer válido** com escopo certo → 200.
+*   **Bearer válido** com escopo errado → 403 `forbidden_scope`.
+*   **Sem token** em endpoint protegido → 401 `unauthorized`.
+*   **Legado**: `/v1/*` com token que não inclui `default:default` → 403.
+
+### 5.3 Rate
+
+*   **Exaustão**: ultrapassar N reqs/intervalo → 429 `rate_limited`, com `retry-after`.
+*   **Headers** corretos em requests abaixo do limite.
+
+### 5.4 Idempotência
+
+*   **Mesmo `Idempotency-Key` + mesmo corpo** → replay 200 igual, sem reexecutar runtime.
+*   **Mesmo `Idempotency-Key` + corpo diferente** → 409.
+*   **TTL** expirado → trata como novo.
+*   **LRU eviction** determinístico (teste com seq monotônico).
+
+### 5.5 E2E “ataque front”
+
+*   **Origem maliciosa** tentando `fetch` → barrado em preflight.
+*   **CORS permissivo em global**, mas `app_tenant` mais restrito → respeitar o mais específico.
+*   **OPTIONS com headers inválidos** (método não permitido) → 403.
+
+* * *
+
+6) Observabilidade e SLOs
+-------------------------
+
+*   **Tracing**: `cors.check`, `auth.validate`, `rate.check`, `idem.check`.
+*   **Métricas**:
+    *   `gate_cors_denied_total`
+    *   `gate_auth_forbidden_scope_total`
+    *   `gate_rate_limited_total`
+    *   `gate_idem_replay_total`
+*   **SLO**: P99 de `POST /execute` ≤ 200 ms (sem fila). Alertar se `rate_limited_total` crescer > X/min.
+
+* * *
+
+7) Contratos de erro (únicos, consistentes)
+-------------------------------------------
+
+Sempre JSON:
+
+```json
+{ "code":"cors_denied", "message":"Origin not allowed for scope a:X/t:Y", "request_id":"...", "retry_after":0 }
+```
+
+*   **Nunca** `text/plain` em 4xx/5xx.
+*   **`request_id` obrigatório** para correlação.
+
+* * *
+
+8) CLI/SDK — ergonomia e testes
+-------------------------------
+
+*   **CLI pública (`ublx`)**:
+    *   `ublx exec --scope a:X/t:Y --idempotency abc --file payload.json`
+    *   Mostra `x-ratelimit-*`, indica replay (icone / nota).
+*   **Tests CLI**:
+    *   Bateria “battle” cobre CORS (com `curl -H Origin`), Auth (401/403/200), Rate (429), Idem (200/409).
+*   **SDKs TS/Py**:
+    *   _Interceptor_ adiciona `Idempotency-Key` auto (hash do corpo se não houver).
+    *   Retorna _typed errors_ a partir de `code`.
+
+* * *
+
+9) Segurança prática
+--------------------
+
+*   **Sem Auth em OPTIONS**; **com Auth** em métodos “fortes”.
+*   **Cookies**: desabilitar por padrão (preferir Bearer); se necessário, `SameSite=Strict`, `Secure`.
+*   **CORS por Scope** evita que um app “A” injete front contra tenant “B”.
+*   **Registros de decisão** (WF) **nunca** embutem segredos; segredos ficam em adapters out-of-band e/ou cifrados.
+
+* * *
+
+10) Roadmap curto (para este capítulo)
+--------------------------------------
+
+1.  Finalizar **predicate CORS** com `parse_scope_from_path()` (inclui OPTIONS).
+2.  Padronizar **AppError JSON** e revisar handlers que ainda retornam `text/plain`.
+3.  Ligar **Rate** + **Idem** com _keys_ escopo-aware; expor headers.
+4.  Escrever **tests** (unit/integration/E2E) listados acima.
+5.  Atualizar **docs**: matriz de decisões, exemplos de preflight, exemplos de erros.
+
+* * *
+
+11) “Gotchas” que quebram fácil
+-------------------------------
+
+*   Rotas com `{cid}` usando `:` no valor → garantir que **não** conflitem com parsers antigos; já padronizado em Axum `{}`.
+*   Middleware de `Content-Type` **não** deve rejeitar **GET** sem header (comportamento idempotente).
+*   CORS **global muito amplo** → torne **(app,tenant)** canônico; global só para _dev_.
+*   Idempotência sem hash do corpo → replays incorretos.
+
+* * *
+
+12) Critérios de aceite
+-----------------------
+
+*   ✅ Preflight válido/negado por escopo, 100% testado.
+*   ✅ Todos 4xx/5xx em **JSON** com `code`.
+*   ✅ Rate/Idem com _keys_ contendo `(app,tenant)` e **testes determinísticos**.
+*   ✅ SDK/CLI exibem `x-ratelimit-*` e detectam replay.
+*   ✅ Observabilidade com métricas e spans para perímetro.
+
+Se estiver ok, sigo para o **Capítulo 4/12 — Pipeline de Execução e Policies (purismo + packs estáticos)**, cobrindo assinatura do _runtime_, cadeia WA→TR→WF, _feature flags_ e contratos de Policy. Quer que eu avance?
+
+## Prompt:
+4
+
+## Response:
+Aqui vai o **Capítulo 4/12 — Pipeline Determinístico e Policies (WA → TR → WF)**. Foco: contrato imutável das fases, _packs estáticos_ de políticas, assinatura do runtime, e testes que garantem reprodutibilidade entre arquiteturas.
+
+4/12 · Execução determinística e cadeia de Policies
+===================================================
+
+Objetivo do capítulo
+--------------------
+
+1.  Padronizar o **contrato WA/TR/WF** (estruturas, hashing, CIDs).
+2.  Fixar o **runtime certificado** (hash/attestation) no recibo.
+3.  Empacotar **policies estáticas** (compile-time), sem IO, sem “surpresas”.
+4.  Entregar **testes e invariantes** que sustentam o receipt-first.
+
+* * *
+
+1) Fases do pipeline: contrato canônico
+---------------------------------------
+
+### 1.1 Tipos (estáveis, em `ubl_core`)
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Phase { WA, TR, WF }
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct Scope { pub app: String, pub tenant: String } // já usado no gate
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ReceiptV1 {
+    pub scope: Scope,
+    pub phase: Phase,
+    pub body_cid: String,          // CID do conteúdo canônico da fase
+    pub parent: Option<String>,    // body_cid da fase anterior (WA<-TR<-WF)
+    pub runtime: RuntimeTag,       // hash/attestation do binário em uso
+    pub policy_trace: Vec<PolicyStep>,
+    pub decision: Decision,        // PASS | RETRY | DENY (apenas em WF)
+    pub ts: i64,                   // instante de emissão (injetado pelo gate)
+    pub sig_cid: String,           // CID do JWS (assinatura) da fase
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct PolicyStep {
+    pub id: &'static str, // ex.: "aml:v1"
+    pub outcome: Decision,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Decision { PASS, RETRY, DENY }
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct RuntimeTag {
+    pub algo: &'static str,  // "sha256"
+    pub digest_hex: String,  // 64 hex chars
+    pub did: String,         // did:key do runtime/fornecedor
+}
+```
+
+### 1.2 CIDs: regra única
+
+*   **Entrada de cada fase** vira **JSON canônico NRF-1** → **BLAKE3** → `b3:<multibase>`.
+*   `body_cid` é do **payload** da fase, não do `ReceiptV1`.
+*   `sig_cid` é do **JWS** (assinatura) que envolve `(scope, phase, body_cid, parent, runtime, policy_trace, decision?, ts)`.
+
+Invariantes:
+
+*   `WA.parent == None`
+*   `TR.parent == Some(WA.body_cid)`
+*   `WF.parent == Some(TR.body_cid)`
+
+* * *
+
+2) Runtime certificado (binário imutável)
+-----------------------------------------
+
+### 2.1 Carimbo do runtime
+
+*   Build com `--locked`, `--release`, `#![forbid(unsafe_code)]`.
+*   Calcular **SHA-256 do ELF** no CI (x86 e ARM).
+*   Publicar `RuntimeTag { algo:"sha256", digest_hex, did }` no ledger e **referenciar** em cada `ReceiptV1`.
+
+### 2.2 Attestation opcional
+
+*   Se houver TEE: incluir `tee.report_cid` dentro do `body` WF e adicionar no `policy_trace` um passo `attestation:PASS/DENY`.
+*   Nunca bloquear a cadeia por ausência do TEE (feature flag separada).
+
+* * *
+
+3) Policies: packs estáticos, sem IO
+------------------------------------
+
+### 3.1 Trait e execução
+
+```rust
+#[async_trait::async_trait]
+pub trait Policy: Send + Sync {
+    fn id(&self) -> &'static str;
+    async fn decide(&self, ctx: &PolicyCtx) -> anyhow::Result<Decision>;
+}
+
+pub struct PolicyCtx<'a> {
+    pub scope: &'a Scope,
+    pub manifest: &'a serde_json::Value, // input canônico
+    pub runtime: &'a RuntimeTag,
+}
+```
+
+Regras:
+
+*   **Ordem determinística** de avaliação (lista fixa).
+*   Primeira não-PASS **encerra** a decisão do WF.
+*   **Sem IO**: sem rede, sem relógio; usar somente o `manifest` (canônico) e o `scope`.
+
+### 3.2 Registro em compile-time
+
+```rust
+pub fn policy_pipeline() -> &'static [&'static dyn Policy] {
+    // feature-gated
+    &[
+        #[cfg(feature="policy-aml")] &AML_V1,
+        #[cfg(feature="policy-pii")] &PII_STRICT_V1,
+        &DEFAULT_ALLOW, // sempre por último
+    ]
+}
+```
+
+### 3.3 Motivos de “static-only”
+
+*   Evita **código arbitrário** em produção.
+*   Garante **hash do runtime** estável (repro).
+*   Simplifica **auditoria** (packs versionados e assinados).
+
+* * *
+
+4) Execução: WA → TR → WF (funções puras + boundary host)
+---------------------------------------------------------
+
+### 4.1 Montagem das fases (alto nível)
+
+```rust
+pub struct ExecInputs { pub scope: Scope, pub manifest: serde_json::Value }
+
+pub async fn execute(inputs: ExecInputs) -> anyhow::Result<(ReceiptV1, ReceiptV1, ReceiptV1)> {
+    // WA
+    let wa_body = canonicalize_wa(&inputs.manifest)?;
+    let wa = sign_phase(&inputs.scope, Phase::WA, None, &wa_body).await?;
+
+    // TR (prova RB→ρ)
+    let tr_body = prove_rb_to_rho(&wa_body)?; // puramente determinístico
+    let tr = sign_phase(&inputs.scope, Phase::TR, Some(wa.body_cid.clone()), &tr_body).await?;
+
+    // WF (decisão final)
+    let (wf_body, trace, decision) = decide_with_policies(&inputs.scope, &tr_body).await?;
+    let mut wf = sign_phase(&inputs.scope, Phase::WF, Some(tr.body_cid.clone()), &wf_body).await?;
+    wf.policy_trace = trace;
+    wf.decision = decision;
+    Ok((wa, tr, wf))
+}
+```
+
+### 4.2 “Boundary host” (Gate)
+
+*   Injeta `ts` e `runtime` no `ReceiptV1` **antes de assinar**.
+*   Persiste `WA/TR/WF` na store **escopada** (`a/{app}/t/{tenant}/…`).
+*   Publica eventos de **TR** e **WF** (cap. 6/12).
+*   Retorna **apenas** WF ao cliente por padrão; WA/TR sob demanda.
+
+* * *
+
+5) Persistência mínima (imutável e escopada)
+--------------------------------------------
+
+Layout no ledger (S3/CAS):
+
+```
+a/{app}/t/{tenant}/r/wa/{wa.body_cid}.json
+a/{app}/t/{tenant}/r/tr/{tr.body_cid}.json
+a/{app}/t/{tenant}/r/wf/{wf.body_cid}.json
+a/{app}/t/{tenant}/jws/{receipt.sig_cid}.json   # envelopes
+```
+
+Projeção opcional (para leitura rápida):
+
+```
+a/{app}/t/{tenant}/idx/tip/{wf.body_cid} -> {wa, tr, wf}
+```
+
+* * *
+
+6) Erros e invariantes (sempre JSON)
+------------------------------------
+
+Códigos relevantes (cap. 3/12 unifica):
+
+*   `invalid_manifest` (NRF não canônico)
+*   `policy_violation` (WF=DENY, com `policy_trace`)
+*   `retry_suggested` (WF=RETRY, incluir hints determinísticos)
+*   `proof_mismatch` (TR inválido contra WA)
+*   `runtime_mismatch` (tag não bate com binário entregue)
+
+Invariantes testados:
+
+*   Reexecutar `execute()` sobre **mesmo manifest** → **mesmos CIDs** (x86/ARM).
+*   `parent` correto entre fases.
+*   `policy_trace` **idempotente** (mesma ordem/saída).
+
+* * *
+
+7) Testes (níveis e vetores)
+----------------------------
+
+### 7.1 Unit (runtime/policies)
+
+*   Canonicalização NRF → CID estável com amostras de strings, mapas ordenados, floats exatos.
+*   Policies com **tabelas** (table-driven): entradas e saídas PASS/RETRY/DENY.
+*   TR prova: WA→TR _round-trip_ não altera semântica.
+
+### 7.2 Integration (gate + ledger fake)
+
+*   `POST /execute` mesma carga 10x → **mesmo tip** (sem idempotency-key, usar `ghost:true` para evitar 409 de idempotência do gate).
+*   GET tip → cadeia completa (com/sem projeção `idx/tip`).
+*   Corrupção simulada em um arquivo → `proof_mismatch`.
+
+### 7.3 Cross-arch
+
+*   Geração de vetores em **x86** e **ARM**; comparar CIDs e `sig_cid`.
+*   Se divergir: teste falha com relatório do primeiro byte discrepante.
+
+### 7.4 Linhas vermelhas
+
+*   Nenhuma policy pode acessar `std::time::SystemTime::now()` diretamente (use `ts` do gate no envelope apenas).
+*   Sem `rand`/`thread_rng` dentro do runtime/policies.
+
+* * *
+
+8) SDK/CLI: ergonomia determinística
+------------------------------------
+
+*   CLI: `ublx exec --scope a:X/t:Y --manifest m.json --out wf.json`
+    *   Flag `--include wa,tr` para depuração.
+    *   Mostra `policy_trace` tabelado; em `DENY`, imprimir “policy:motivo”.
+*   SDKs: expor `verify(receipt)`
+    *   Recalcula `body_cid`, verifica `sig_cid`, valida `parent`.
+    *   Opcionalmente baixa WA/TR a partir do `tip` para reconstruir a cadeia.
+
+* * *
+
+9) Observabilidade
+------------------
+
+Spans obrigatórios:
+
+*   `runtime.canonicalize_wa`
+*   `runtime.prove_rb_to_rho`
+*   `policy.decide[{id}]` (com tag outcome)
+*   `gate.sign_phase`, `gate.persist`, `gate.publish`
+
+Métricas:
+
+*   `gate_receipt_emitted_total{phase}`
+*   `gate_policy_outcome_total{policy_id,outcome}`
+*   `gate_execute_seconds_bucket` (P50/P95/P99)
+
+* * *
+
+10) Migração segura (se houver legado dinâmico)
+-----------------------------------------------
+
+1.  Congelar loader dinâmico (feature‐flag retirado do build).
+2.  Introduzir packs estáticos equivalentes.
+3.  Rodar _shadow_ por 1 semana: executar **ambos** e comparar `WF.decision`.
+4.  Se 100% ok, remover código dinâmico.
+
+* * *
+
+11) “Gotchas” comuns
+--------------------
+
+*   **Floats**: sempre serializar em forma canônica e evitar NaN/Inf (rejeitar no parse).
+*   **Ordenação de chaves**: map JSON **ordenado** por chave; nunca depender de `serde_json::Map` aleatório.
+*   **CIDs em URL** com `:`: rotas Axum devem usar `{cid}` (não `:cid`).
+*   **Assinatura**: assinar o **envelope** (`ReceiptV1`), não apenas o corpo.
+
+* * *
+
+12) Critérios de aceite
+-----------------------
+
+*   ✅ Reexecução bit-a-bit: **mesmos CIDs** (x86/ARM).
+*   ✅ `parent` encadeado corretamente (WA←TR←WF).
+*   ✅ `policy_trace` determinístico e auditável.
+*   ✅ Todos erros em **JSON** com `code`.
+*   ✅ Vetores cross-arch publicados no repo (fixtures) e usados no CI.
+
+Se quiser, já trago um **pacote mínimo de policies** (ex.: `pii:strict`, `aml:v1`, `size:limit`) com casos de teste e vetores para usar de base no repositório.
+
+## Prompt:
+Leia as mensagens anteriores, e continue, agora eh a 5
+
+5) Idempotência (LRU+TTL) Estável
+Middleware com chave (app,tenant,method,path,idemp_key) + body_sha. Corrija ordem determinística com seq monotônico (evita empates de Instant). Tests: New/Replay/Progress/Expired/Evict.
+
+## Response:
+Aqui vai o **Capítulo 5/12 — Idempotência (LRU + TTL) Estável**. Foco: chaveamento por escopo + método + caminho + idemp\_key + hash do corpo; estados New/Progress/Replay/Expired/Evict; correção de empates via **sequência monotônica**; testes.
+
+5/12 · Idempotência determinística e previsível
+===============================================
+
+Objetivo do capítulo
+--------------------
+
+1.  Definir a **chave** de idempotência com consciência de escopo.
+2.  Especificar a **máquina de estados** (New/Progress/Replay/Expired/Evict).
+3.  Implementar **LRU + TTL** com resolução determinística (seq).
+4.  Expor **contrato HTTP** (headers) e códigos.
+5.  Cobrir **testes de unidade/integrados** e casos de contorno.
+
+* * *
+
+1) Chave canônica (escopo + método + caminho + idempotency-key + body\_sha)
+---------------------------------------------------------------------------
+
+A idempotência deve ser “exata o suficiente” para repetir apenas o que for realmente a mesma intenção:
+
+```
+Key = H(
+  scope.app, scope.tenant,
+  method, path,                     // path normalizado (sem query-string)
+  idempotency_key,                  // obrigatório p/ métodos mutantes (POST/PUT/PATCH/DELETE)
+  body_sha256                       // payload canônico (NRF-1) ou SHA do corpo bruto
+)
+```
+
+Regras:
+
+*   `idempotency_key`: obrigatório nos endpoints mutantes. Se ausente, o **gate** pode:
+    *   (A) negar (400 `missing_idempotency_key`), ou
+    *   (B) aceitar apenas com `ghost:true` (sem efeitos colaterais), conforme política.
+*   `body_sha256`: se o endpoint recebe **JSON canônico**, use o SHA do JSON canônico (após normalização). Caso contrário, use SHA do corpo bruto.
+*   `path`: sem query-string; parâmetros dinâmicos **já resolvidos** (ex.: `/a/{app}/t/{tenant}/v1/execute`).
+
+* * *
+
+2) Máquina de estados
+---------------------
+
+Para cada `Key`, o store mantém:
+
+```rust
+enum IdempCheck {
+  New,        // primeira vez
+  Progress,   // já em execução (em outra thread/processo)
+  Replay {    // já houve resposta final (200/4xx/5xx definitivos)
+    status: u16,
+    etag: Option<String>,
+    location: Option<String>,
+    body_cid: Option<String>, // dica p/ re-hidratar
+  },
+  Expired,    // registro existe, mas TTL venceu — tratar como New (e renovar)
+  Evict,      // política de LRU expulsou — tratar como New (regravar)
+}
+```
+
+Estados persistidos:
+
+*   `Pending` → criado no início da execução; contém `created_at`, `seq`, `body_hash`.
+*   `Final { status, etag?, location?, body_cid? }` → gravado ao concluir com sucesso/falha.
+*   `Stale/Expired` → `created_at + ttl < now`.
+
+**Transições**:
+
+*   `New` → grava `Pending` (CAS: só se não existe).
+*   `Progress` → retorna 409 (`retry_after`) com cabeçalhos de “trava amigável”.
+*   `Replay` → retorna **a mesma resposta** (status e metadados); corpo pode ser re-hidratado via `body_cid`/cache.
+*   `Expired | Evict` → tratar como `New` (regravar `Pending` e seguir fluxo normal).
+
+* * *
+
+3) LRU + TTL com ordem determinística (seq monotônico)
+------------------------------------------------------
+
+Problema clássico: entradas criadas “no mesmo instante” podem empatar ao escolher a vítima de LRU. Solução:
+
+*   Guardar `(created_at: Instant, seq: u64)` e ordenar por `(created_at, seq)`; `seq` é um contador **global e monotônico** do store.
+*   Em concorrência, `seq` é incrementado sob **Mutex/RwLock** (barreira curta) ou com `AtomicU64` + fetch\_add.
+
+Estrutura (simplificada):
+
+```rust
+pub struct EntryMeta {
+  pub created_at: Instant,
+  pub seq: u64,
+}
+
+pub enum Entry {
+  Pending { meta: EntryMeta, body_sha: [u8; 32] },
+  Final   { meta: EntryMeta, status: u16, etag: Option<String>, location: Option<String>, body_cid: Option<String> },
+}
+
+pub struct IdempotencyStore {
+  ttl: Duration,
+  cap: usize,
+  seq: AtomicU64,
+  map: HashMap<Key, Entry>,
+}
+```
+
+Evicção:
+
+*   Quando `map.len() >= cap`, selecionar a **menor** `(created_at, seq)` entre entradas que **não estão em Progress** (ou seja, `Pending` também pode ser vitimada se desejado, mas recomendo priorizar expulsar `Final`).
+*   Para segurança contra _thundering herd_, considerar uma **janela de proteção**: não evictar `Pending` com `created_at < now + grace_ms`.
+
+TTL:
+
+*   `Expired`: `now - created_at > ttl`. Ao detectar, tratar como `New` e sobrescrever.
+
+* * *
+
+4) Middleware (ordem e semântica)
+---------------------------------
+
+Ordem sugerida no stack do Axum:
+
+1.  **Scope extractor** (resolve `/a/{app}/t/{tenant}/…`)
+2.  **Auth** (se houver)
+3.  **Content-Type guard** (só para métodos com corpo)
+4.  **Idempotency** (antes do handler mutante)
+5.  **Rate-limit** (opcional antes/depois; se antes, ajuda a conter DDoS sem “sujar” o store)
+6.  **Handler**
+7.  **Idempotency finalize** (grava `Final` a partir do resultado)
+
+Pseudo:
+
+```rust
+// before
+match store.check(scope, method, path, idemp_key, body_sha) {
+  New | Expired | Evict => proceed_and_mark_pending(),
+  Progress => return http_409_with_retry_after(),
+  Replay { status, etag, location, body_cid } => return rebuild_response(...),
+}
+
+// after (on success or handled failure)
+store.finalize(key, status, etag, location, body_cid);
+```
+
+**Importante**: “falhas definitivas” (4xx/5xx não transitórios) **devem** gerar `Replay` (mesma resposta).  
+Falhas “quentes” (ex.: 503 upstream) — opcional: não finalizar para permitir nova tentativa (fica em `Pending` com timeout).
+
+* * *
+
+5) Contrato HTTP
+----------------
+
+### Requisição
+
+*   `Idempotency-Key: <opaque>` (obrigatório p/ mutantes)
+*   `X-Body-SHA256: <hex>` (opcional; se ausente e corpo JSON canônico, o gate calcula; senão, rejeita 400)
+
+### Respostas
+
+*   **409 Conflict** (Progress)
+    *   `Retry-After: <segundos>` (ex.: 2)
+    *   `Idempotency-Key: <mesmo>`
+    *   `X-Idempotency-State: progress`
+*   **2xx/4xx/5xx** (Final/Replay)
+    *   `Idempotency-Key: <mesmo>`
+    *   `X-Idempotency-State: replay|final`
+    *   `ETag: <etag>` (se houver)
+    *   `Location: <url>` (se houver)
+*   **400** (erros de contrato)
+    *   `missing_idempotency_key`
+    *   `body_hash_mismatch` (se header fornecido não bate com corpo)
+    *   `invalid_key_format` (opcional)
+
+* * *
+
+6) Concurrency e atomicidade
+----------------------------
+
+*   **CAS** de `Pending`: use `map.entry(key).or_insert_with(...)` sob lock; se já existir `Pending/Final`, devolva `Progress/Replay`.
+*   **Finalize**: substituir atomically `Pending → Final`.
+*   **Crash safety**: se o processo cair entre `Pending` e `Final`, a entrada fica em `Progress` até `ttl` → depois vira `Expired` e novas tentativas entram como `New`.
+
+* * *
+
+7) Testes (unitários + integrados)
+----------------------------------
+
+### 7.1 Unit — `idempotency.rs`
+
+*   `new_then_progress`: primeira chamada → `New`, segunda antes do finalize → `Progress`.
+*   `final_then_replay`: após `finalize`, próxima chamada → `Replay{status,..}` e **mesmos cabeçalhos**.
+*   `expired_becomes_new`: avança o relógio além do TTL → `Expired` → tratar como `New`.
+*   `lru_eviction_is_deterministic`: inserir `cap+2` entradas **no mesmo instante**; com `seq` monotônico, a vítima é **determinística**.
+*   `body_sha_mismatch`: se header não bate, 400 e **não grava** `Pending`.
+*   `no_idempotency_key_mutating`: POST sem cabeçalho → 400 (ou 202 ghost-only conforme modo escolhido).
+*   `replay_preserves_status_bodycid`: checa persistência de `status`, `etag`, `location`, `body_cid`.
+
+### 7.2 Integrados — `gate` (Axum)
+
+*   `POST /execute` com mesmo `Idempotency-Key` e **mesmo** corpo:
+    *   1ª → 200 + `X-Idempotency-State: final`
+    *   2ª (imediata) → 200 + `X-Idempotency-State: replay` (sem executar runtime/policies).
+*   `POST /execute` mesma key **corpo diferente** → 409 `body_hash_mismatch` (ou 422), não muda store.
+*   `progress_window`: disparar duas requisições concorrentes; uma recebe 200 e outra 409 com `Retry-After`.
+*   `ttl_rollover`: simular queda do processo; após TTL, nova chamada segue como `New`.
+
+* * *
+
+8) Observabilidade
+------------------
+
+Métricas:
+
+*   `gate_idemp_check_total{state}` — contagem por `New|Progress|Replay|Expired|Evict`.
+*   `gate_idemp_entries{status="pending|final"}` — _gauge_.
+*   `gate_idemp_evictions_total` — contagem de evicções.
+
+Tracing:
+
+*   `idemp.check` (tags: hash\_prefix, state)
+*   `idemp.finalize` (tags: status, etag\_present, location\_present)
+
+* * *
+
+9) Segurança e DoS
+------------------
+
+*   **Limitar** tamanho do corpo antes de calcular SHA (pre-flight via `Content-Length`).
+*   **Cap** ajustável e **TTL** curto (ex.: 2–5 min) para endpoints quentes.
+*   **Keys** muito longas → truncar/hashear antes de usar como parte da chave.
+*   **Scope-aware** garante isolamento entre tenants/apps.
+
+* * *
+
+10) Compatibilidade
+-------------------
+
+*   Endpoints **idempotentes por natureza** (GET/HEAD) **não** usam store (short-circuit).
+*   Para `PUT` com ETag, o `Replay` devolve o mesmo ETag/Location, preservando semântica HTTP.
+*   `Location`/`body_cid` ajudam o cliente a reidratar resposta sem reprocessar.
+
+* * *
+
+11) Parâmetros de ambiente
+--------------------------
+
+```
+IDEMP_TTL_SECS=180
+IDEMP_CAP=10000
+IDEMP_FINALIZE_ON_5XX=false   # se true, 5xx também viram Replay
+```
+
+* * *
+
+12) Critérios de aceite
+-----------------------
+
+*   ✅ Sem empates não determinísticos: política de LRU sempre previsível (seq).
+*   ✅ `Replay` bit-a-bit: mesma resposta (status, ETag, Location).
+*   ✅ `Progress` previsível em corrida, com `Retry-After`.
+*   ✅ Cobertura de testes: New/Replay/Progress/Expired/Evict/body-mismatch.
+*   ✅ Métricas e spans expostos.
+
+Se quiser, eu preparo o patch final para o `IdempotencyStore` com a interface `check()/finalize()` e o middleware de Axum, junto com o kit de testes (unit + integ) já no padrão do repositório.
+
+## Prompt:
+Agora eh a 6
+
+6) Rate Limit por Escopo
+Atualize o limitador para (app,tenant,client_id) e exponha cabeçalhos X-RateLimit-* no CORS. Tests: burst, refill, e isolamento entre tenants.
+
+7) Receipt API à Prova de “b3:”
+Garanta que GET /v1/receipt/{cid} aceita b3:... sem exigir Content-Type. Respostas JSON padronizadas via AppError (code, message, request_id, retry_after). Tests cobrindo b3: e CIDs inexistentes.
+
+8) “Battle Script” end-to-end
+Rode gate com auth ligada; crie sempre user → app → tenant via CLI pública/admin (sem atalhos). Cenários: determinismo com ghost:true, CORS em três camadas, audit report, /receipts e /audit antes/depois, e isolamento entre dois tenants.
+
+9) CLI Pública como Fonte da Verdade
+Faça a UI e testes integrais consumirem exatamente o que a CLI consome (mesmo contrato). Se houver descompasso CLI admin ↔ API, abra issue “alignment” com: contrato esperado, contrato atual, e teste reprodutor.
+
+10) EventBus (Iggy) Plugável
+Após persistir (ledger), publique ReceiptEvent { scope, phase, cid, parent, decision, ts }. Trait EventBus com impl IggyEventBus. Tests: at-least-once (reprocessamento idempotente), partição por app:tenant.
+
+11) Observabilidade Base
+Tracing spans (gate.request, policy.decide, runtime.exec, ledger.put, event.publish), Prometheus (pass/deny/retry; hist de exec), e dashboard mínimo. Testes de métricas: exporta e conta passa.
+
+12) Receipt UI (Canvas) → Integração
+A página do canvas já está estável (corrigido o ) no copy). Próximos passos:
+	•	Ligar ?cid=... → fetch real, com “Demo Mode” quando sem cid.
+	•	“Verify” abrir guia com instruções (CLI ublx verify + libs).
+	•	Testes leves já existem; adicione: PASS/RETRY/DENY altera progress, popovers acessíveis (aria), “Copy All” inclui links.self, e modo impressão exibe faixa de autenticidade.
+
+## Response:
+Thought for 4 seconds
+
+Aqui vai o **Capítulo 6/12 — Rate Limit por Escopo**. Objetivo: tornar o limitador **consistente com o modelo de escopo** e observável, sem atrito com CORS, idempotência e auth.
+
+6/12 · Rate limit por (app, tenant, client\_id)
+===============================================
+
+1) Chave de limitação (Scope-aware)
+-----------------------------------
+
+```
+RateKey = H(
+  scope.app, scope.tenant,          // extraído do path /a/{app}/t/{tenant}/...
+  client_id,                         // do token (auth) ou "anonymous" (quando permitido)
+  method,                            // opcional (p.ex. diferenciar GET vs POST)
+  route_id                           // opcional: ID estável da rota p/ granularidade
+)
+```
+
+Regras:
+
+*   **client\_id**: vem do middleware de auth. Para dev token/CLI, usar um `client_id` fixo (ex.: `dev:cli`).
+*   Requests **sem escopo** (legacy `/v1/*`) mapeiam para `app=default, tenant=default`.
+*   Opcional: **burst buckets** separados por método (ex.: GET possui limites mais altos).
+
+* * *
+
+2) Algoritmo: Token-Bucket com janela deslizante
+------------------------------------------------
+
+*   **Token Bucket** (refill contínuo) → baixa latência e comportamento previsível sob burst.
+*   Estrutura por chave:
+    ```rust
+    struct Bucket {
+      capacity: u32,         // ex.: 100
+      refill_per_sec: f32,   // ex.: 20 tokens/s
+      tokens: f32,
+      last_refill: Instant,
+    }
+    ```
+*   A cada request: `tokens = min(capacity, tokens + Δt * refill_per_sec)`.
+    *   Se `tokens >= cost` → aceita, `tokens -= cost` (cost default = 1).
+    *   Senão → **429 Too Many Requests** + `Retry-After`.
+
+**Custos diferenciados**:
+
+*   `GET/HEAD` cost 1, `POST/PUT/PATCH` cost 2–5 (opcional).
+*   Endpoints críticos (ex.: `/execute`) podem ter **classe de bucket** própria.
+
+* * *
+
+3) Cabeçalhos HTTP (expostos via CORS)
+--------------------------------------
+
+Responder SEMPRE (aceito ou 429) com:
+
+*   `X-RateLimit-Limit: <capacidade>`
+*   `X-RateLimit-Remaining: <restante arredondado>`
+*   `X-RateLimit-Reset: <epoch_seconds>` (quando o bucket volta a >= 1 token)
+*   Em 429, adicionar `Retry-After: <segundos>`
+
+CORS:
+
+*   No `CorsLayer`, incluir em `expose_headers`:
+    ```
+    x-ratelimit-limit,x-ratelimit-remaining,x-ratelimit-reset,retry-after
+    ```
+*   Preflight (`OPTIONS`) **não** consome tokens, mas deve **espelhar** limites da rota-alvo quando possível (opcional).
+
+* * *
+
+4) Integração no stack
+----------------------
+
+Ordem sugerida (Axum):
+
+1.  **Scope extractor** (resolve app/tenant a partir do path)
+2.  **Auth** (preenche `client_id`)
+3.  **Content-Type guard** (se aplicável)
+4.  **Idempotency check (read)** – não consome tokens em `Replay`
+5.  **Rate Limit** ← AQUI (consome tokens apenas se o request vai executar)
+6.  **Handler**
+7.  **Idempotency finalize**
+8.  **AppError mapper** (uniformiza JSON)
+
+Regras de interação:
+
+*   Se `Idempotency::Replay`, **não** debitar bucket (resposta de cache lógico).
+*   Se `Idempotency::Progress`, retornar 409 e **não** debitar.
+*   Em **DENY** de policy (4xx), já debitou (correto: o request existiu).
+*   Em erro 5xx transitório, decidir se debita (padrão: **sim**, para conter “martelada”).
+
+* * *
+
+5) Configuração (env) por escopo
+--------------------------------
+
+Permitir defaults e overrides:
+
+```
+# Defaults globais
+RATE_CAPACITY=100
+RATE_REFILL_PER_SEC=20
+
+# Overrides por app:tenant (chave = "app,tenant")
+RATE_OVERRIDE__myapp,acme__CAPACITY=300
+RATE_OVERRIDE__myapp,acme__REFILL_PER_SEC=60
+
+# Overrides por client_id (mais específico que escopo)
+RATE_CLIENT__partner:foo__CAPACITY=600
+RATE_CLIENT__partner:foo__REFILL_PER_SEC=120
+```
+
+Resolução (ordem): `client_id override` → `(app,tenant) override` → `global default`.
+
+* * *
+
+6) API de middleware (esqueleto)
+--------------------------------
+
+```rust
+pub struct RateLimiter {
+  store: DashMap<RateKey, Bucket>,
+  now: fn() -> Instant,        // injetável p/ testes
+}
+
+impl RateLimiter {
+  pub fn check(&self, key: &RateKey, cost: f32) -> Decision {
+    let mut b = self.store.entry(key.clone()).or_insert_with(|| self.make_bucket(key)).value_mut();
+    let now = (self.now)();
+    let dt = now.saturating_duration_since(b.last_refill).as_secs_f32();
+    b.tokens = (b.tokens + dt * b.refill_per_sec).min(b.capacity as f32);
+    b.last_refill = now;
+    if b.tokens >= cost {
+      b.tokens -= cost;
+      Decision::Allow {
+        limit: b.capacity,
+        remaining: b.tokens,
+        reset_epoch: calc_reset_epoch(b),
+      }
+    } else {
+      let need = cost - b.tokens;
+      let retry = (need / b.refill_per_sec).ceil() as u64;
+      Decision::Throttle {
+        limit: b.capacity,
+        remaining: b.tokens.max(0.0),
+        reset_epoch: (now + Duration::from_secs(retry)).duration_since(UNIX_EPOCH).as_secs(),
+        retry_after_secs: retry,
+      }
+    }
+  }
+}
+```
+
+No `IntoResponse`, preencher headers de rate limit em **todas** as respostas.
+
+* * *
+
+7) Testes
+---------
+
+### 7.1 Unit
+
+*   **burst\_accepts\_until\_capacity**: consome `capacity` requisições, a `capacity+1` → 429 com `Retry-After > 0`.
+*   **refill\_progressively**: avança relógio; `Remaining` sobe e volta a aceitar.
+*   **cost\_by\_method**: `POST` consome mais tokens que `GET`.
+*   **override\_resolution\_order**: `client_id` override vence `app,tenant`; fallback para global.
+*   **reset\_epoch\_monotonic**: `X-RateLimit-Reset` nunca retrocede dentro do ciclo.
+
+### 7.2 Integração
+
+*   **isolation\_between\_tenants**: `myapp/acme` e `myapp/contoso` não afetam os buckets um do outro (mesmo client\_id).
+*   **legacy\_scope\_defaults**: `/v1/execute` cai em `default:default`.
+*   **replay\_does\_not\_debit**: duas chamadas com mesma `Idempotency-Key` → 2ª é `Replay`, `Remaining` não diminui.
+*   **preflight\_exposes\_headers**: `OPTIONS` retorna cabeçalhos CORS corretos com `access-control-expose-headers` incluindo `X-RateLimit-*`.
+
+* * *
+
+8) Observabilidade
+------------------
+
+Métricas Prometheus:
+
+*   `gate_ratelimit_decisions_total{outcome="allow|throttle"}`
+*   `gate_ratelimit_bucket_tokens{scope,client_id}` (gauge amostrado periodicamente — opcional)
+*   `gate_ratelimit_retry_after_seconds` (histograma)
+
+Tracing:
+
+*   `rate.check` (tags: scope, client\_id, route\_id, outcome, remaining)
+
+* * *
+
+9) Falhas e hardening
+---------------------
+
+*   **Clock skew**: usar `Instant` local; `Reset` usa `SystemTime` apenas para o header.
+*   **Ataques de cardinalidade**: limitar número de chaves vivas (`DashMap` + LRU por último acesso).
+*   **Cold start burst**: aquecer buckets com `tokens=capacity` (padrão), ou metade em tenants ruidosos.
+*   **Token precision**: `f32` suficiente; se quiser precisão exata, usar `u64` (microtokens) e aritmética inteira.
+
+* * *
+
+10) Contrato de erros (AppError)
+--------------------------------
+
+Mesmo para 429, responder JSON padronizado:
+
+```json
+{
+  "error": { "code": "rate_limited", "message": "Too Many Requests" },
+  "request_id": "r-abc123",
+  "retry_after": 2
+}
+```
+
+E cabeçalhos `X-RateLimit-*` + `Retry-After`.
+
+* * *
+
+11) Compatibilidade com CLI/UI
+------------------------------
+
+*   CLI `ublx` pode imprimir `X-RateLimit-*` quando `--verbose` (ajuda a entender recuos).
+*   UI: mostrar “cooldown” com base em `Retry-After` e `Remaining/Limit`.
+
+* * *
+
+12) Critérios de aceite
+-----------------------
+
+*   ✅ Limitação **por escopo** (app, tenant, client\_id), isolada entre tenants.
+*   ✅ `X-RateLimit-*` + `Retry-After` presentes em todas as respostas relevantes e **expostos** no CORS.
+*   ✅ Comportamento em **burst** previsível, **refill** suave, e integração com **Idempotency** (replays não debitam).
+*   ✅ Suite de testes unit + integração cobrindo burst, refill e isolamento.
+
+Se quiser, preparo já o patch do middleware (com `DashMap`, `Instant`, config por env e exposição de headers) e a bateria de testes de integração usando o mini-server Axum de testes.
+
+## Prompt:
+7!
+
+## Response:
+Aqui vai o **Capítulo 7/12 — Receipt API à prova de “b3:”**. Foco: rotas que aceitam `b3:...` sem atrito, respostas **sempre** em JSON padronizado e casos de erro previsíveis.
+
+7/12 · Receipt API à prova de `b3:…`
+====================================
+
+1) Objetivos
+------------
+
+*   `GET /v1/receipt/{cid}` e `GET /a/{app}/t/{tenant}/v1/receipt/{cid}` aceitam **qualquer CID válido**, inclusive com **`:`** (`b3:…`), **sem exigir** `Content-Type`.
+*   Respostas de erro **uniformes** via `AppError` (`code`, `message`, `request_id`, `retry_after?`) — inclusive 400/404/429/5xx.
+*   Cobertura de testes: `b3:` feliz, **CID inexistente**, **CID malformado**, e comportamento em **legacy vs. scoped**.
+
+* * *
+
+2) Rotas & extração do parâmetro
+--------------------------------
+
+**Axum 0.7** usa chaves `{param}`. Troque `:cid` → `{cid}` e garanta rotas **scoped** e **legacy**:
+
+```rust
+// scoped (preferencial)
+.route("/a/{app}/t/{tenant}/v1/receipt/{cid}", get(api::get_receipt))
+// legacy (fallback p/ default:default)
+.route("/v1/receipt/{cid}", get(api::get_receipt_legacy))
+```
+
+> Nota: `:` dentro do **segmento** de path não quebra o matcher; o problema clássico era rota não bater por sintaxe antiga. Com `{cid}` isso desaparece.
+
+* * *
+
+3) Guard de Content-Type (GET não exige)
+----------------------------------------
+
+Se você tem um guard global “JSON only”, **pule GET/HEAD**:
+
+```rust
+fn require_json_on_write(req: &Request<Body>) -> bool {
+    match *req.method() {
+        Method::POST | Method::PUT | Method::PATCH => true,
+        _ => false, // GET/HEAD/DELETE não exigem Content-Type
+    }
+}
+```
+
+Aplique o guard só quando `true`. Isso elimina o 400 “Bad Request (Content-Type)” em GET.
+
+* * *
+
+4) Parsing e validação do CID
+-----------------------------
+
+Trate **duas entradas**:
+
+*   `cid` “cru” do path (pode vir percent-encoded)
+*   `cid` com **prefixo amigável** opcional, ex.: `cid:b3:…`
+
+```rust
+fn normalize_cid(raw: &str) -> Result<String, AppError> {
+    // 1) decode %3A se vier percent-encoded
+    let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+    let s = decoded.as_ref();
+
+    // 2) strip "cid:" se presente
+    let s = s.strip_prefix("cid:").unwrap_or(s);
+
+    // 3) validação mínima: deve começar com "b3:" e ter tamanho esperado
+    if !s.starts_with("b3:") { 
+        return Err(AppError::bad_request("invalid_cid_prefix", "CID must start with b3:"));
+    }
+    if s.len() != 2 + 1 + 64 { // "b3:" + 64 hex
+        return Err(AppError::bad_request("invalid_cid_length", "CID length mismatch"));
+    }
+
+    // 4) (opcional) validar charset/hex
+    if !s[3..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request("invalid_cid_chars", "CID contains non-hex chars"));
+    }
+
+    Ok(s.to_string())
+}
+```
+
+> Se você já tem um **tipo** `Cid` na crate de core, mova essa lógica para lá e exponha `Cid::parse(&str)` para reutilização (gate, CLI, testes).
+
+* * *
+
+5) Handler unificado com `AppError` (JSON sempre)
+-------------------------------------------------
+
+### Esquema de sucesso (200)
+
+```json
+{
+  "cid": "b3:…",
+  "phase": "WF",
+  "decision": "PASS",
+  "jws": { "alg":"Ed25519","kid":"did:key:…","payload":"…" },
+  "links": { "self": "/…/receipt/b3:…", "verify": "/…/verify/b3:…" },
+  "runtime": { "did":"did:key:…", "sha256":"…" }
+}
+```
+
+### Esquema de erro (padrão)
+
+```json
+{
+  "error": { "code": "not_found", "message": "Receipt not found" },
+  "request_id": "r-abc123",
+  "retry_after": 0
+}
+```
+
+### Handler (resumo)
+
+```rust
+pub async fn get_receipt(
+    Extension(state): Extension<AppState>,
+    scope: Scope,                    // /a/{app}/t/{tenant}/...
+    Path(cid_raw): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let cid = normalize_cid(&cid_raw)?;
+
+    // 1) look-up no storage 'scoped' (app:tenant:cid)
+    if let Some(doc) = state.receipts.get(&scope.scoped_cid(&cid)) {
+        return Ok(Json(scrub_for_public(doc)));
+    }
+
+    // 2) fallback legacy (compat)
+    if let Some(doc) = state.receipts.get(&cid) {
+        return Ok(Json(scrub_for_public(doc)));
+    }
+
+    Err(AppError::not_found("not_found", "Receipt not found"))
+}
+
+pub async fn get_receipt_legacy(
+    Extension(state): Extension<AppState>,
+    Path(cid_raw): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    // projeta para scope default:default
+    get_receipt(Extension(state), Scope::default(), Path(cid_raw)).await
+}
+```
+
+> `scrub_for_public` remove metadados internos (`__tenant_id`, etc.) e garante **determinismo** de campos/ordem (útil para diffs e impressão).
+
+* * *
+
+6) Links canônicos e Self-Discovery
+-----------------------------------
+
+Monte `links.self` respeitando **escopo**:
+
+*   Scoped: `"/a/{app}/t/{tenant}/v1/receipt/{cid}"`
+*   Legacy: `"/v1/receipt/{cid}"`
+
+Para a UI/CLI, ofereça **ambos** se disponível:
+
+```json
+"links": { "self": "/a/app/t/tenant/v1/receipt/b3:…", "self_legacy": "/v1/receipt/b3:…" }
+```
+
+* * *
+
+7) Cabeçalhos & CORS
+--------------------
+
+*   **Não exigir** `Content-Type` em GET.
+*   CORS: manter `expose-headers` já ampliados (rate limit, retry-after).
+*   Cache-control (opcional): accepted **public, immutable** caso o receipt seja imutável e público no seu domínio:
+    ```
+    Cache-Control: public, max-age=31536000, immutable
+    ```
+
+* * *
+
+8) Testes (unit + integração)
+-----------------------------
+
+### Unit — `normalize_cid`
+
+*   `ok_b3_plain`: `"b3:…"` válido → Ok
+*   `ok_b3_with_prefix`: `"cid:b3:…"` → Ok
+*   `ok_b3_percent`: `"b3%3A…"` → Ok
+*   `bad_prefix`: `"z3:…"` → `invalid_cid_prefix`
+*   `bad_len`: `"b3:short"` → `invalid_cid_length`
+*   `bad_chars`: `"b3:…g…"` → `invalid_cid_chars`
+
+### Integração — handler
+
+1.  **Scoped b3**  
+    `GET /a/x/t/y/v1/receipt/b3:…` → 200 JSON, `links.self` scoped, body sem campos internos.
+2.  **Legacy b3**  
+    `GET /v1/receipt/b3:…` → 200 JSON, `links.self` legacy.
+3.  **Inexistente**  
+    `GET /v1/receipt/b3:FFFFFFFF…` → 404 JSON (`code=not_found`), **sem** exigir Content-Type.
+4.  **Malformado**  
+    `GET /v1/receipt/b3:Z…` → 400 JSON (`code=invalid_cid_chars`).
+5.  **Percent-encoded**  
+    `GET /v1/receipt/b3%3Aabcd…` → 200 JSON (se existe).
+6.  **CORS + GET**  
+    `OPTIONS` preflight para `/v1/receipt/b3:…` → 204/200 com `Access-Control-Allow-*` correto; `GET` real não retorna 400 por Content-Type ausente.
+7.  **Isolamento**  
+    Receipt existe em `x:y`, mas **não** em `x:z` → `404` no escopo errado.
+8.  **AppError shape**  
+    Para 400/404/5xx, assert JSON com `error.code`, `message`, `request_id` e (se 429) `retry_after`.
+
+> Dica: injete `Scope` e um `AppState` de teste com mapa em memória; use o **mesmo** `AppError` do runtime (via `IntoResponse`) para padronizar.
+
+* * *
+
+9) Segurança & UX
+-----------------
+
+*   **Timing**: mensagens de erro padronizadas evitam leak de existência (“user enumeration” análogo).
+*   **Log**: trace com `request_id` incluído na resposta; isso fecha o loop de suporte.
+*   **CLI/UI**: sempre aceitar `cid:b3:…` e `b3:…`; CLI pode imprimir a URL canônica e já abrir a UI.
+
+* * *
+
+10) Compat & Migração
+---------------------
+
+*   Manter `GET /v1/receipt/{cid}` por um ciclo LTS como **alias** de `default:default`.
+*   Emite `Deprecation` header (opcional) com dica do caminho scoped:
+    ```
+    Deprecation: true
+    Link: </a/{app}/t/{tenant}/v1/receipt/{cid}>; rel="alternate"
+    ```
+
+* * *
+
+11) Critérios de aceite
+-----------------------
+
+*   ✅ `GET` aceita `b3:` (cru e percent-encoded), **sem** exigir `Content-Type`.
+*   ✅ Erros 400/404/429/5xx em **JSON** (`AppError`), com `request_id`.
+*   ✅ Testes cobrindo feliz, inexistente, malformado, legacy e scoped.
+*   ✅ Links canônicos corretos por escopo, sem vazar metadados internos.
+
+* * *
+
+12) Próximos passos (ligação com Cap. 8)
+----------------------------------------
+
+*   “Battle Script” deve:
+    *   Criar receipt → validar `GET` em **scoped** e **legacy**.
+    *   Exercitar `b3%3A…` (encoded) e inexistente.
+    *   Checar **CORS** e **RateLimit headers** expostos em GET (quando habilitados).
+    *   Validar **AppError** shape uniformizado.
+
+Se quiser, te mando um patch pronto contendo: `normalize_cid` no core, rotas `{cid}`, guard condicional de Content-Type, `AppError` com `IntoResponse`, testes unit/integration e fixtures mínimos de store em memória.
+
+## Prompt:
+8:
+
+8) “Battle Script” end-to-end
+Rode gate com auth ligada; crie sempre user → app → tenant via CLI pública/admin (sem atalhos). Cenários: determinismo com ghost:true, CORS em três camadas, audit report, /receipts e /audit antes/depois, e isolamento entre dois tenants.
+
+9) CLI Pública como Fonte da Verdade
+Faça a UI e testes integrais consumirem exatamente o que a CLI consome (mesmo contrato). Se houver descompasso CLI admin ↔ API, abra issue “alignment” com: contrato esperado, contrato atual, e teste reprodutor.
+
+10) EventBus (Iggy) Plugável
+Após persistir (ledger), publique ReceiptEvent { scope, phase, cid, parent, decision, ts }. Trait EventBus com impl IggyEventBus. Tests: at-least-once (reprocessamento idempotente), partição por app:tenant.
+
+11) Observabilidade Base
+Tracing spans (gate.request, policy.decide, runtime.exec, ledger.put, event.publish), Prometheus (pass/deny/retry; hist de exec), e dashboard mínimo. Testes de métricas: exporta e conta passa.
+
+12) Receipt UI (Canvas) → Integração
+A página do canvas já está estável (corrigido o ) no copy). Próximos passos:
+	•	Ligar ?cid=... → fetch real, com “Demo Mode” quando sem cid.
+	•	“Verify” abrir guia com instruções (CLI ublx verify + libs).
+	•	Testes leves já existem; adicione: PASS/RETRY/DENY altera progress, popovers acessíveis (aria), “Copy All” inclui links.self, e modo impressão exibe faixa de autenticidade.
+
+## Response:
+Aqui vai o **Capítulo 8/12 — “Battle Script” end-to-end**. É um script único, autodocumentado e “fail-fast”, que cobre: **auth ON**, criação **user→app→tenant** via CLIs (sem atalhos), **determinismo com `ghost:true`**, **CORS** (global → app → tenant), **auditoria** antes/depois, **/receipts** e **/audit**, e **isolamento** entre dois tenants. Inclui também checks de **rate-limit headers**, **preflight**, e retornos JSON padronizados.
+
+> Pré-requisitos:
+> 
+> *   `ubl_gate` já compilado (`cargo build --release -p ubl_gate`)
+> *   CLIs: `ublx` (pública) e `ublx-admin` (admin) no `PATH`
+> *   `jq`, `curl`
+> *   Gate escutando em `http://localhost:3000` com auth **ligada** (tokens dev habilitados)
+>     
+
+* * *
+
+### `battle.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========== CONFIG ==========
+GATE="${GATE:-http://localhost:3000}"
+AUTH_GOOD="${AUTH_GOOD:-ubl-dev-token-001}"   # token válido mapeado para default tenant/app, ou via admin
+AUTH_BAD="${AUTH_BAD:-invalid-token}"
+UA="battle/1.0"
+
+# Usuário/App/Tenant canônicos para os cenários
+USER_EMAIL_1="danvoulez@example.com"
+APP_1="dan-projects"
+TENANT_1="profissional"
+
+USER_EMAIL_2="guest@example.com"
+APP_2="guest-app"
+TENANT_2="sandbox"
+
+# CORS origins para os 3 níveis
+ORIGIN_GLOBAL="https://global.example"
+ORIGIN_APP_1="https://app1.example"
+ORIGIN_TENANT_1="https://prof.example"
+
+# Helpers
+jqget(){ jq -r "$1"; }
+hdr(){ grep -i "^$1:" | sed -E "s/^$1:[[:space:]]*//I"; }
+log(){ printf "\n\033[1m▶ %s\033[0m\n" "$*"; }
+
+curlj(){
+  # curl JSON with bearer and UA, capture code+body+headers
+  local method="$1"; shift
+  local url="$1"; shift
+  curl -sS -X "$method" "$url" \
+    -H "User-Agent: $UA" \
+    -H "Authorization: Bearer $AUTH_GOOD" \
+    -H "Content-Type: application/json" "$@"
+}
+
+curll(){
+  # raw curl (used for preflight / header checks)
+  curl -sS -D - "$@" -o /tmp/_body.txt
+}
+
+require_json_error(){
+  local code expected_code
+  code="$1"; expected_code="$2"
+  [[ "$code" == "$expected_code" ]] || { echo "Expected HTTP $expected_code, got $code"; exit 1; }
+  jq -e '.error.code and .error.message and .request_id' /tmp/_body.txt > /dev/null
+}
+
+# ========== 0) GATE HEALTH + AUTH BASELINE ==========
+log "0) Health e Auth baseline"
+curl -sS "$GATE/healthz" | jq -e '.ok == true' >/dev/null
+echo "• /healthz ok"
+
+# auth ON → sem token dá 401 JSON (AppError shape)
+log "Auth checks (no token e token inválido)"
+curll -X GET "$GATE/v1/receipts"
+HTTP=$(grep -Eo "^HTTP/[^ ]+ [0-9]{3}" /tmp/_body.txt | tail -1 | awk '{print $2}')
+require_json_error "$HTTP" "401" && echo "• 401 no token (JSON AppError)"
+
+curll -X GET "$GATE/v1/receipts" -H "Authorization: Bearer $AUTH_BAD"
+HTTP=$(grep -Eo "^HTTP/[^ ]+ [0-9]{3}" /tmp/_body.txt | tail -1 | awk '{print $2}')
+require_json_error "$HTTP" "401" && echo "• 401 bad token (JSON AppError)"
+
+# ========== 1) USER → APP → TENANT (CLIs) ==========
+log "1) Criar user → app → tenant (sem atalhos)"
+
+# 1.1 Usuario
+UBLX_USER_ID=$(ublx user create --email "$USER_EMAIL_1" | jqget '.user_id')
+echo "• user1: $UBLX_USER_ID"
+
+# 1.2 App (admin) – app deve existir por um admin (sem “atalho mágico” no gate)
+APP1_ID=$(ublx-admin app create --name "$APP_1" --owner "$UBLX_USER_ID" | jqget '.app_id')
+echo "• app1: $APP1_ID"
+
+# 1.3 Tenant (admin) – idem
+TENANT1_ID=$(ublx-admin tenant create --app "$APP1_ID" --slug "$TENANT_1" | jqget '.tenant_id')
+echo "• tenant1: $TENANT1_ID"
+
+# 1.4 Convidar usuário para o app/tenant (por email; fluxo “aceite rápido” se já logado)
+INV_CODE=$(ublx-admin invite create --app "$APP1_ID" --tenant "$TENANT1_ID" --email "$USER_EMAIL_1" | jqget '.invite_code')
+echo "• invite code: $INV_CODE"
+ublx invite accept --code "$INV_CODE" 1>/dev/null && echo "• convite aceito"
+
+# ========== 2) RECEIPT BEFORE/AFTER + DETERMINISMO ==========
+log "2) /receipts e determinismo (ghost:true evita 409 de idempotência de negócio)"
+
+echo "{}" > /tmp/payload.json # seu payload canônico de teste pode ser maior
+
+# Antes: não deve haver receipts
+curlj GET "$GATE/a/$APP_1/t/$TENANT_1/v1/receipts" | jq -e 'length == 0 or (type=="object")' >/dev/null
+echo "• /receipts vazio (ou mapa vazio)"
+
+# Execução determinística: mesmo manifesto/policy + ghost:true gera múltiplos WA/WF mas com SAME CIDs
+MANIFEST="$(jq -n '{
+  pipeline:"test",
+  in_grammar:{inputs:{__prev_output__:""},mappings:[],output_from:"__prev_output__"},
+  out_grammar:{inputs:{__prev_output__:""},mappings:[],output_from:"__prev_output__"},
+  policy:{allow:true}
+}')"
+
+for i in 1 2 3; do
+  TIP=$(curlj POST "$GATE/a/$APP_1/t/$TENANT_1/v1/execute" \
+    --data "$(jq -n --argjson mf "$MANIFEST" '{manifest:$mf, vars:{__prev_output__:"battle"}, ghost:true}')" \
+    | jqget '.tip_cid')
+  echo "• run#$i tip=$TIP"
+  [[ "$TIP" =~ ^b3: ]] || { echo "CID inválido"; exit 1; }
+  TIPS+=" $TIP"
+done
+
+# assert todos iguais
+set -- $TIPS
+[[ "$1" == "$2" && "$2" == "$3" ]] || { echo "Determinismo falhou: $TIPS"; exit 1; }
+TIP="$1"
+echo "• determinismo OK (mesmo tip_cid)"
+
+# Depois: receipts presentes
+curlj GET "$GATE/a/$APP_1/t/$TENANT_1/v1/receipts" | jq -e "has(\"$TIP\")" >/dev/null
+echo "• /receipts contém $TIP"
+
+# Receipt API “à prova de b3:” (sem exigir Content-Type)
+RCPT=$(curl -sS -H "Authorization: Bearer $AUTH_GOOD" "$GATE/a/$APP_1/t/$TENANT_1/v1/receipt/$TIP")
+echo "$RCPT" | jq -e ".cid == \"$TIP\"" >/dev/null && echo "• /receipt/{b3:...} ok"
+
+# ========== 3) AUDIT BEFORE/AFTER ==========
+log "3) /audit antes/depois"
+
+# Audit após execuções
+curlj GET "$GATE/a/$APP_1/t/$TENANT_1/v1/audit" | jq -e '.summary and .breakdown' >/dev/null
+echo "• audit (scoped) ok"
+
+# ========== 4) CORS: global → app → tenant ==========
+log "4) CORS (global, app, tenant) + preflight"
+
+# Configure via env/CLI admin (exemplo conceitual; adapte ao seu mecanismo de config)
+ublx-admin cors set-global --origins "$ORIGIN_GLOBAL" >/dev/null
+ublx-admin cors set-app    --app "$APP1_ID"    --origins "$ORIGIN_APP_1" >/dev/null
+ublx-admin cors set-tenant --tenant "$TENANT1_ID" --origins "$ORIGIN_TENANT_1" >/dev/null
+echo "• CORS configs aplicadas"
+
+preflight(){
+  local ORG="$1"
+  curll -X OPTIONS "$GATE/a/$APP_1/t/$TENANT_1/v1/receipt/$TIP" \
+    -H "Origin: $ORG" \
+    -H "Access-Control-Request-Method: GET" \
+    -H "Access-Control-Request-Headers: Authorization"
+  HTTP=$(grep -Eo "^HTTP/[^ ]+ [0-9]{3}" /tmp/_body.txt | tail -1 | awk '{print $2}')
+  [[ "$HTTP" =~ ^(200|204)$ ]] || { echo "Preflight falhou ($ORG): $HTTP"; exit 1; }
+  ALLOW=$(hdr "Access-Control-Allow-Origin")
+  echo "• Preflight $ORG → Allow-Origin=$ALLOW"
+}
+
+# Tenant vence sobre app, que vence sobre global
+preflight "$ORIGIN_GLOBAL"
+preflight "$ORIGIN_APP_1"
+preflight "$ORIGIN_TENANT_1"
+
+# GET real com CORS + RateLimit headers expostos
+curll -H "Origin: $ORIGIN_TENANT_1" \
+     -H "Authorization: Bearer $AUTH_GOOD" \
+     "$GATE/a/$APP_1/t/$TENANT_1/v1/receipt/$TIP"
+ALLOW=$(hdr "Access-Control-Allow-Origin"); echo "• GET CORS allow=$ALLOW"
+RLIM=$(hdr "x-ratelimit-limit"); RREM=$(hdr "x-ratelimit-remaining")
+echo "• RateLimit headers: limit=$RLIM remaining=$RREM"
+
+# ========== 5) ISOLAMENTO ENTRE TENANTS ==========
+log "5) Isolamento de dados (tenant B não enxerga receipt de A)"
+
+# Cria user/app/tenant 2
+USER2_ID=$(ublx user create --email "$USER_EMAIL_2" | jqget '.user_id')
+APP2_ID=$(ublx-admin app create --name "$APP_2" --owner "$USER2_ID" | jqget '.app_id')
+TENANT2_ID=$(ublx-admin tenant create --app "$APP2_ID" --slug "$TENANT_2" | jqget '.tenant_id')
+INV2=$(ublx-admin invite create --app "$APP2_ID" --tenant "$TENANT2_ID" --email "$USER_EMAIL_2" | jqget '.invite_code')
+ublx invite accept --code "$INV2" 1>/dev/null
+
+# Tentativa de ler receipt do tenant1 a partir do tenant2 → 404 JSON
+curll -H "Authorization: Bearer $AUTH_GOOD" \
+      "$GATE/a/$APP_2/t/$TENANT_2/v1/receipt/$TIP"
+HTTP=$(grep -Eo "^HTTP/[^ ]+ [0-9]{3}" /tmp/_body.txt | tail -1 | awk '{print $2}')
+require_json_error "$HTTP" "404" && echo "• isolamento ok (404 no escopo errado)"
+
+# ========== 6) RATE LIMIT: burst/refill e isolamento ==========
+log "6) Rate limit: burst/refill + isolamento (por app,tenant,client_id)"
+
+# 3 hits rápidos → remaining deve decrescer
+for i in 1 2 3; do
+  curll -H "Authorization: Bearer $AUTH_GOOD" "$GATE/a/$APP_1/t/$TENANT_1/v1/receipt/$TIP"
+  echo "• hit#$i remaining=$(hdr x-ratelimit-remaining)"
+done
+
+# Tenant2 não “consome” o bucket do tenant1
+curll -H "Authorization: Bearer $AUTH_GOOD" "$GATE/a/$APP_2/t/$TENANT_2/v1/receipts"
+echo "• tenant2 remaining=$(hdr x-ratelimit-remaining) (bucket distinto)"
+
+# (Opcional) Forçar 429 e validar AppError+retry_after
+# Repetir chamadas até retornar 429, então:
+# require_json_error "$HTTP" "429" && echo "• 429 shape ok (retry_after=$(hdr Retry-After))"
+
+# ========== 7) RECEIPTS & AUDIT (LEGACY vs SCOPED) ==========
+log "7) Legacy vs Scoped"
+
+# Scoped (já validado). Agora legacy como alias default:default (se habilitado)
+curll -H "Authorization: Bearer $AUTH_GOOD" "$GATE/v1/receipt/$TIP"
+HTTP=$(grep -Eo "^HTTP/[^ ]+ [0-9]{3}" /tmp/_body.txt | tail -1 | awk '{print $2}')
+if [[ "$HTTP" == "200" ]]; then
+  echo "• legacy receipt compat ativa"
+else
+  echo "• legacy receipt indisponível (ok se desativado por política de migração)"
+fi
+
+echo -e "\n✅ BATTLE: passou por auth, criação canônica, determinismo, CORS 3 camadas, audit, isolamento, rate-limit e Receipt API b3.\n"
+```
+
+* * *
+
+### Notas de design e verificação
+
+*   **Determinismo**: o script usa `ghost:true` para evitar colisões de idempotência de negócio; o **CID do `tip`** deve se repetir nas 3 execuções.
+*   **CORS**: testamos **preflight OPTIONS** e **GET real** com `Origin` variando; o **tenant** deve sobrescrever o **app**, que sobrescreve o **global**.
+*   **Receipt API**: o `GET /receipt/{b3:...}` não envia `Content-Type`, garantindo que o guard só exige JSON para **writes**.
+*   **AppError shape**: erros 401/404 (e 429 se você habilitar a parte comentada) são validados por JSON com `error.code`, `message`, `request_id`, e `Retry-After` quando aplicável.
+*   **Isolamento**: criamos um **segundo tenant** e confirmamos que **não** é possível ler o receipt do primeiro (404 scoped).
+*   **Rate-limit**: confirmamos **counters por escopo** `(app,tenant,client_id)` e que **tenants** não compartilham bucket.
+
+* * *
+
+### Como rodar
+
+```bash
+chmod +x battle.sh
+GATE=http://localhost:3000 AUTH_GOOD=ubl-dev-token-001 ./battle.sh
+```
+
+Se quiser simular exaustão de **rate-limit**, reduza o limite no gate (ou aumente os hits) e descomente o bloco de 429.
+
+* * *
+
+Se quiser, eu adapto o script para **mk/Justfile** com alvos (`just battle`), ou que **suba o gate** automaticamente (com `nohup` + health-wait) e faça o teardown no final.
+
+## Prompt:
+9
+
+## Response:
+Capítulo 9/12 — CLI Pública como Fonte da Verdade
+-------------------------------------------------
+
+**Tese:** tudo que a UI e os testes de integração fazem deve ser **idêntico** ao que um usuário faria com a **CLI pública (`ublx`)**. A CLI vira o **contrato operacional** do ecossistema. A CLI admin (`ublx-admin`) só cobre trilhas administrativas; nada “exclusivo” deve existir nela que não tenha reflexo de consumo na pública.
+
+* * *
+
+### 9.1 Contrato Único: “o que a CLI fala é lei”
+
+1.  **Spec gerado da CLI → API**
+    *   A CLI pública **não** contém lógica de negócio. Ela é um **thin client** sobre um único contrato OpenAPI (ou similar) versionado.
+*   Gere `openapi.json` a partir do **código do gate** (derivado dos handlers), **não** da CLI.
+*   A CLI consome esse spec para gerar:
+    *   Tipos (serde) e validadores.
+    *   Tabela de comandos/flags → endpoints/métodos/headers.
+        2.  **UI consome o mesmo spec/SDK**
+    *   A UI usa o **mesmo cliente** que a CLI (mesma lib gerada/SDK).
+*   Se a CLI enxerga um campo novo, a UI enxerga também — sem forks.
+    3.  **Sem atalhos fora da CLI**
+    *   Fluxos de produto (onboarding, emissão de recibo, auditoria) **existem 1:1** na CLI.
+*   Qualquer operação “só existe na UI” ou “só via API admin” é **cheiro de desalinhamento**.
+
+* * *
+
+### 9.2 Estrutura da CLI (pública)
+
+```
+ublx
+├─ auth
+│  ├─ login                     # troca por token; salva profile local (~/.ublx/config)
+│  └─ status                    # mostra tenant/app corrente, expiração, scopes
+├─ scope
+│  ├─ select --app A --tenant T # fixa app/tenant p/ sessão/profile
+│  └─ show
+├─ user
+│  ├─ create --email E          # inicia conta (com flow de confirmação, se on)
+│  └─ invite-accept --code C    # aceite “sem fricção” se já autenticado
+├─ app
+│  └─ join --id APP_ID | --slug # entra em app existente (via convite ou política aberta)
+├─ tenant
+│  └─ join --id TEN_ID | --slug # idem
+├─ execute
+│  ├─ run --manifest M.json [--vars V.json] [--ghost]
+│  └─ verify --cid b3:...       # verifica receipt (hash + JWS)
+├─ receipts
+│  ├─ list                      # lista (scoped)
+│  └─ get  --cid b3:...         # retorna (scoped)
+└─ audit
+   └─ report [--format json|md]  # resumo + breakdown + timeline (scoped)
+```
+
+*   **Padrão de flags**: tudo que é “ambiente” (gate URL, token, app/tenant) pode vir via env `UBL_*` e é sobreposto por flags.
+*   **Saídas estáveis**: use `--json` para imprimir **somente** JSON; sem logs misturados.
+
+* * *
+
+### 9.3 Golden Tests de Contrato (CLI ⇄ API ⇄ UI)
+
+Crie uma suíte de “goldens” (Instantâneos) versionada:
+
+*   **Comandos** → **requests**: cada subcomando da CLI tem pares `stdin → stdout.json` e `stdout.md` (quando aplicável).
+*   **Round-trip**: UI e testes e2e devem **reutilizar** as mesmas funções de cliente (SDK) — os mesmos mocks/in-memory também.
+*   **Invariantes** (exemplos):
+    *   `execute run` com o mesmo manifest + `--ghost` gera **mesmo** `tip_cid`.
+    *   `receipts get` nunca exige `Content-Type`.
+    *   Erros seguem `AppError` `{ code, message, request_id, retry_after? }`.
+    *   Cabeçalhos \*_X-RateLimit-_ \*\* são expostos quando CORS válido.
+
+Automatize com um runner:
+
+```bash
+# pseudo-make
+golden:
+  # 1) levanta gate com profile “test”
+  # 2) roda ublx ... --json > .golden/...
+  # 3) compara com fixtures (ou atualiza com flag --update)
+```
+
+* * *
+
+### 9.4 Boundary Tests de Compatibilidade
+
+Teste o “triângulo” **CLI pública ↔ API pública ↔ UI**:
+
+1.  **Smoke** (por commit):
+    *   `ublx auth status` ⇒ 200 / shape ok
+*   `ublx execute run --ghost` ⇒ `tip_cid` b3:\*
+*   `ublx receipts get --cid ...` ⇒ JSON receipt válido
+    2.  **Compat menor (SemVer)**:
+    *   Adições de campos **não** quebram CLI (`serde(default)`).
+*   Flags novas têm **default** compatível.
+    3.  **Compat maior**:
+    *   Planeje “janela” de depreciação: CLI vN continua funcional enquanto API mantém **alias** (ex.: rota legacy `/v1/...` apontando p/ `/a/{app}/t/{tenant}/v1/...`).
+
+* * *
+
+### 9.5 Playbook de Alinhamento (quando der drift)
+
+Quando perceber descompasso **CLI admin ↔ API admin** ou **CLI pública ↔ API pública**:
+
+1.  **Abra issue `alignment:` com o template:**
+
+```
+alignment: <área>
+contrato_esperado:
+  - comando: ublx <path> [flags]
+  - request: METHOD PATH (headers)
+  - response: <json schema curto>
+contrato_atual:
+  - ...
+impacto:
+  - testes que falharam: <links>
+  - UIs afetadas: <quais>
+proposta:
+  - fix server|fix cli|adicionar alias|migração em 2 etapas
+teste_reprodutor:
+  - script curto (curl/ublx) + asserts
+```
+
+2.  **Decisão em 24–48h**:
+    *   Escolha **1**: **corrigir servidor** para bater no esperado (preferível se é bug de regressão).
+*   Escolha **2**: **corrigir CLI** e publicar **release** + **changelog** + **alias** temporário no server.
+    3.  **Execução**:
+    *   Adicione **teste de não regressão** na suíte golden e e2e.
+*   Se houver mudança de rota/campos: mantenha **alias** por 1–2 versões e logue depreciação.
+
+* * *
+
+### 9.6 Observabilidade de Contrato
+
+*   Exponha métrica: `cli_contract_mismatch_total` (label `area=auth|receipts|audit|...`, `kind=shape|status|header`).
+*   Trace: `cli.request`, `cli.parse`, `cli.render` com `request_id` do gate propagado.
+*   Alertas leves quando `mismatch_total` > 0 por N minutos.
+
+* * *
+
+### 9.7 “Test Harness” único (reuso por UI)
+
+*   `packages/clients/ubl` (Rust): **SDK** compartilhado (HTTP client + tipos).
+*   A CLI importa esse SDK; a UI (TS/WASM ou HTTP bridge) **também**.
+*   Tests de integração rodam contra um **gate real** ou **stub** que implementa o mesmo **trait** do SDK (in-memory).
+
+* * *
+
+### 9.8 Políticas de Versão e Depreciação
+
+*   **SemVer**:
+    *   **Major**: quebra de rota/campos/semântica → RFC + migração.
+    *   **Minor**: campos novos, endpoints adicionais.
+    *   **Patch**: correção sem efeito no contrato.
+*   **Changelog dirigido por CLI**: cada release destaca
+    *   Novos comandos/flags.
+    *   Campos novos nas respostas.
+    *   Aliases adicionados e data de remoção.
+
+* * *
+
+### 9.9 Checklists de PR
+
+**Server (gate):**
+
+*    Atualizou `openapi.json`/spec?
+*    AppError consistente em todos os handlers novos?
+*    Rotas novas têm versão (`/v1/...`) e, se substituir antigas, **alias** configurado?
+*    Testes: unit + e2e (via CLI) cobrindo sucesso/erro.
+
+**CLI pública:**
+
+*    Comando tem `--json` fiel ao spec.
+*    Flags mapeiam 1:1 com headers/params.
+*    Mensagens humanas **separadas** do `--json`.
+*    Golden atualizado (`--update` se aprovado).
+
+**UI:**
+
+*    Usa SDK comum (sem fetch manual divergente).
+*    E2E roda **usando o mesmo endpoint e shape** da CLI.
+*    Story “erro do gate” (AppError) renderiza code/message/retry.
+
+* * *
+
+### 9.10 Exemplos de Casos Limite (inclua na suíte)
+
+*   `GET /v1/receipt/{cid}` com `b3:` e **sem** `Content-Type` → 200 JSON.
+*   `404` de receipt inexistente → `AppError` shape ok.
+*   Rate-limit: cabeçalhos **expostos** via CORS válido.
+*   `execute --ghost` repetido 3× → `tip_cid` idêntico.
+*   Tenant B **não** enxerga receipt de Tenant A (404).
+*   Alias legacy (`/v1/...` vs `/a/{app}/t/{tenant}/v1/...`) quando habilitado.
+
+* * *
+
+### 9.11 Deliverables imediatos
+
+*    Publicar **SDK comum** e apontar CLI e UI para ele.
+*    Gerar/commitar `openapi.json` no repo do gate (CI valida drift).
+*    Criar `golden/` com 10+ cenários core (auth, execute, receipts, audit, errors).
+*    Implantar **template de `alignment:`** e obrigar uso quando UI/CLI quebrar.
+*    Adicionar métrica `cli_contract_mismatch_total`.
+
+* * *
+
+### 9.12 Resultado esperado
+
+*   **Zero drift perceptível**: qualquer evolução do servidor se reflete **simultaneamente** em CLI e UI.
+*   **Onboarding confiável**: demos e scripts reproduzíveis usando só `ublx`.
+*   **Debugar vira trivial**: reproduções com **1 comando** e outputs estáveis.
+
+Se quiser, já redijo o `openapi.json` mínimo (handlers de `execute`, `receipt`, `receipts`, `audit`) e a estrutura do SDK para você plugar no repo.
+
+## Prompt:
+10
+
+10) EventBus (Iggy) Plugável
+Após persistir (ledger), publique ReceiptEvent { scope, phase, cid, parent, decision, ts }. Trait EventBus com impl IggyEventBus. Tests: at-least-once (reprocessamento idempotente), partição por app:tenant.
+
+11) Observabilidade Base
+Tracing spans (gate.request, policy.decide, runtime.exec, ledger.put, event.publish), Prometheus (pass/deny/retry; hist de exec), e dashboard mínimo. Testes de métricas: exporta e conta passa.
+
+12) Receipt UI (Canvas) → Integração
+A página do canvas já está estável (corrigido o ) no copy). Próximos passos:
+	•	Ligar ?cid=... → fetch real, com “Demo Mode” quando sem cid.
+	•	“Verify” abrir guia com instruções (CLI ublx verify + libs).
+	•	Testes leves já existem; adicione: PASS/RETRY/DENY altera progress, popovers acessíveis (aria), “Copy All” inclui links.self, e modo impressão exibe faixa de autenticidade.
+
+## Response:
+Capítulo 10/12 — EventBus (Iggy) Plugável
+-----------------------------------------
+
+**Objetivo:** após persistir no **ledger**, publicar um **ReceiptEvent** em um backbone de eventos para projeções assíncronas (indexer, buscas, auditor, webhooks). Garantias: _at-least-once_, ordenação por **(app:tenant)**, deduplicação simples por **event\_id** e latência baixa.
+
+* * *
+
+### 10.1 Esquema do evento (estável)
+
+Envelope mínimo — imutável e versionado:
+
+```json
+{
+  "v": 1,
+  "event_id": "evt_b3:...",           // b3 do próprio evento (CID do JSON canônico)
+  "scope": { "app": "dan-projects", "tenant": "profissional" },
+  "phase": "WA|TR|WF",
+  "cid": "b3:...",                    // body_cid do recibo da fase
+  "parent": "b3:...|null",            // encadeamento WA->TR->WF
+  "decision": "PASS|RETRY|DENY|null", // só em WF
+  "ts": "2026-02-14T14:22:08Z"        // carimbo do Gate (derivado do receipt)
+}
+```
+
+Regras:
+
+*   **Partition key:** `"{app}:{tenant}"`.
+*   **Key do registro no broker:** `event_id`.
+*   **Schema evolution:** apenas _additive_; campos novos têm `serde(default)` nos consumidores.
+
+* * *
+
+### 10.2 Abstração plugável
+
+```rust
+#[async_trait::async_trait]
+pub trait EventBus: Send + Sync {
+    async fn publish(&self, topic: &str, partition_key: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
+    async fn health(&self) -> anyhow::Result<()>;
+}
+
+pub struct NoopBus;
+#[async_trait::async_trait]
+impl EventBus for NoopBus {
+    async fn publish(&self, _: &str, _: &str, _: &[u8], _: &[u8]) -> anyhow::Result<()> { Ok(()) }
+    async fn health(&self) -> anyhow::Result<()> { Ok(()) }
+}
+```
+
+**Contrato operacional do Gate:** `ledger.put` **antes**, `bus.publish` **depois**; em falha, retornar **200** do recibo, mas logar/metricar erro de publicação e disparar **retry** assíncrono.
+
+* * *
+
+### 10.3 Iggy implementation (prod) + memória (test)
+
+```rust
+pub struct IggyEventBus {
+    client: iggy::Client,            // cliente oficial
+    topic_receipts: String,          // ex.: "receipts"
+    acks: iggy::Acks,                // ex.: Acks::Leader
+    timeout: Duration,               // ex.: 500ms
+}
+
+#[async_trait::async_trait]
+impl EventBus for IggyEventBus {
+    async fn publish(&self, topic: &str, part_key: &str, key: &[u8], val: &[u8]) -> anyhow::Result<()> {
+        let partition = iggy::partition_from_key(part_key);
+        self.client
+            .produce(topic, partition)
+            .key(key)
+            .value(val)
+            .acks(self.acks)
+            .timeout(self.timeout)
+            .send()
+            .await?;
+        Ok(())
+    }
+    async fn health(&self) -> anyhow::Result<()> {
+        self.client.ping().await.map_err(Into::into)
+    }
+}
+```
+
+**Bus em memória** (para testes/unit):
+
+```rust
+#[derive(Default, Clone)]
+pub struct MemBus(pub Arc<Mutex<Vec<(String,String,Vec<u8>,Vec<u8>)>>>);
+
+#[async_trait::async_trait]
+impl EventBus for MemBus {
+    async fn publish(&self, t:&str, k:&str, key:&[u8], val:&[u8]) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push((t.to_string(), k.to_string(), key.to_vec(), val.to_vec()));
+        Ok(())
+    }
+    async fn health(&self) -> anyhow::Result<()> { Ok(()) }
+}
+```
+
+* * *
+
+### 10.4 Publicação no fluxo do Gate
+
+No handler `execute_runtime` (após persistir WA/TR/WF):
+
+```rust
+let evt = ReceiptEvent::from(&receipt, &scope);        // monta JSON canônico v1
+let evt_bytes = to_canonical_json(&evt)?;              // NRF-like (ordenado)
+let event_id = blake3_multibase(&evt_bytes);           // “evt_b3:...”
+let key = event_id.as_bytes();
+let part = scope.partition_key();                      // "app:tenant"
+
+// publish sem bloquear resposta do cliente
+let bus = state.event_bus.clone();
+let topic = state.cfg.topics.receipts.clone();
+tokio::spawn(async move {
+    let _ = bus.publish(&topic, &part, key, &evt_bytes).await
+        .map_err(|e| tracing::error!(%event_id, %part, "event_publish_error={e}"));
+});
+```
+
+**Motivo do `spawn`:** a publicação não afeta a _durabilidade_ do recibo (já persistido). Erro vira telemetria + retry (ver §10.7).
+
+* * *
+
+### 10.5 Particionamento e ordenação
+
+*   **Tópico único:** `receipts`.
+*   **N partições** (≥ número de tenants / throughput).
+*   **Chave de partição:** `app:tenant` → **ordem relativa preservada** por escopo.
+*   **Consumidores oficiais**:
+    *   `indexer` (idempotente por `event_id`),
+    *   `audit-proj` (sumários),
+    *   `searcher` (Tantivy),
+    *   `webhook-bridge` (entrega externa resiliente).
+
+* * *
+
+### 10.6 Idempotência & at-least-once
+
+**Garantias:**
+
+*   Gate pode publicar **duas vezes** (retry, crash depois de persistir).
+*   Consumidor **deve** fazer _dedupe_ por `event_id`.
+
+Padrão de consumidor:
+
+```rust
+// pseudo-código
+loop {
+  let msg = consumer.next().await?;
+  let evt: ReceiptEvent = parse(msg.value)?;
+  if dedupe_store.seen(&evt.event_id) { consumer.ack(msg); continue }
+  apply_projection(evt).await?;
+  dedupe_store.mark(&evt.event_id);
+  consumer.ack(msg);
+}
+```
+
+**Dedupe store**: LRU+TTL (memória) + persistência leve (SQLite ou RocksDB) para crash-recovery.
+
+* * *
+
+### 10.7 Retry, DLQ e backpressure
+
+*   **Retry no Gate:** fila em memória com _jitter_ exponencial (ex.: 100ms→1s→5s→30s) limitada por escopo.
+*   **DLQ (opcional no início):** um tópico `receipts.dlq` para eventos que falham N vezes seguidas (marcar `reason`, `last_error`).
+*   **Backpressure:** se `publish` bloquear > `timeout`, logue `warn` e enfileire retry; nunca bloqueie a resposta do `/execute`.
+
+* * *
+
+### 10.8 Configuração
+
+`ENV` (exemplos):
+
+```
+IGGY_BROKER_ADDR=iggy://localhost:8090
+IGGY_TOPIC_RECEIPTS=receipts
+IGGY_ACKS=leader
+IGGY_TIMEOUT_MS=500
+EVENTS_ENABLED=1
+```
+
+Se `EVENTS_ENABLED=0`, inicializar `NoopBus` (feature flag para ambientes mínimos).
+
+* * *
+
+### 10.9 Segurança
+
+*   **Rede:** Iggy com TLS mTLS quando disponível; caso contrário, túnel restrito (ex.: rathole).
+*   **AutZ no Gate:** o conteúdo do evento é **público interno** (não contém PII sensível por design), mas o broker exige **credenciais** do Gate/consumidores oficiais.
+*   **Hardening:** limitar quem pode criar tópicos/partições; política de retenção (ex.: 7–30 dias) + _compaction_ por `key`.
+
+* * *
+
+### 10.10 Testes
+
+**Unit (bus/serdes):**
+
+*   Serialização canônica (ordem de chaves → `event_id` estável).
+*   `MemBus` recebe `(topic, partition_key, key=event_id, value)` corretos.
+
+**Integration (Gate + MemBus):**
+
+1.  **Publica WF após persistir**
+    *   Chamar `/execute` → assert de que `MemBus` recebeu 3 eventos (WA, TR, WF) na ordem, mesma `partition_key`.
+2.  **At-least-once**
+    *   Simular erro na 1ª publicação → retry → **dois** eventos idênticos no bus; consumidor idempotente aplica 1x.
+3.  **Particionamento por escopo**
+    *   Executar em dois tenants → verificar `partition_key` diferentes e **ordem relativa** por escopo.
+4.  **Desligado (Noop)**
+    *   `EVENTS_ENABLED=0` → nenhum publish, recibo ok.
+
+**E2E (Iggy real opcional):**
+
+*   Subir broker, criar tópico `receipts` com N partições.
+*   Rodar `ublx execute --ghost` 10x → consumir e conferir sequência WA→TR→WF; latência p50/p99.
+
+* * *
+
+### 10.11 Observabilidade
+
+Métricas no Gate:
+
+*   `event_publish_total{result="ok|err", phase, app, tenant}`
+*   `event_publish_latency_seconds{phase}` (histograma)
+*   `event_retry_queue_depth{app,tenant}`
+
+Tracing:
+
+*   `event.publish` (attrs: `event_id`, `phase`, `partition_key`, `topic`)
+*   Correlacionar com `request_id` do `/execute`.
+
+Alertas:
+
+*   Taxa de erro de publish > 1% por 5 min.
+*   Fila de retry acima de limiar.
+
+* * *
+
+### 10.12 Migração & compat
+
+*   **Fase 1 (shadow):** publicar eventos **além** do comportamento atual; consumidores podem ignorar.
+*   **Fase 2:** habilitar indexer/search/audit _apenas_ via EventBus (sem varrer pastas).
+*   **Compat:** `event.v` no payload; mudanças _breaking_ exigem novo `v`.
+
+* * *
+
+### 10.13 Entregáveis
+
+*   `event.rs`: `ReceiptEvent` + `to_canonical_json()`.
+*   `bus.rs`: `EventBus`, `NoopBus`, `MemBus`, `IggyEventBus`.
+*   `cfg`: parsing de ENV + `AppState { event_bus }`.
+*   Wiring no `execute_runtime` (publica WA/TR/WF).
+*   Testes unit + integração (MemBus) + opcional E2E (Iggy).
+*   Métricas/Tracing e dashboards mínimos.
+
+* * *
+
+### 10.14 Resultado
+
+*   Projeções reativas, isolamento por escopo, **at-least-once** robusto com dedupe simples e latência baixa.
+*   O **modelo receipt-first** permanece a fonte de verdade; o EventBus é o **sistema nervoso** do ecossistema.
+
+## Prompt:
+11
+
+## Response:
+Capítulo 11/12 — Observabilidade Base
+-------------------------------------
+
+Objetivo: tornar o **gate** e o **runtime** introspectáveis “de fábrica”, com **tracing** consistente, **métricas Prometheus** acionáveis, logs estruturados e um **dashboard mínimo**. O foco é medir: volume/latência por fase (WA/TR/WF), decisões (PASS/RETRY/DENY), erros (por código), CORS/limiter/idempotência, e publicação no EventBus.
+
+* * *
+
+### 11.1 Padrões e dependências
+
+*   **Tracing:** `tracing`, `tracing-subscriber`, `tracing-error`, `opentelemetry` (opcional).
+*   **Métricas:** `metrics`, `metrics-exporter-prometheus` (pull-based em `/metrics`).
+*   **Logs:** `tracing` → **JSON** (um por linha), com `request_id`, `scope.app`, `scope.tenant`.
+
+```rust
+// no lib.rs (app_with_state)
+use metrics_exporter_prometheus::PrometheusBuilder;
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+fn init_obs() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
+    // tracing
+    let fmt_layer = fmt::layer()
+        .json()
+        .with_timer(fmt::time::UtcTime::rfc_3339())
+        .with_target(false)
+        .with_file(false)
+        .with_line_number(false);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,hyper=warn,axum=warn".into());
+    tracing_subscriber::registry().with(filter).with(fmt_layer).init();
+
+    // metrics /metrics
+    let builder = PrometheusBuilder::new();
+    let handle = builder.install_recorder().ok()?;
+    Some(handle)
+}
+```
+
+Expor `/metrics`:
+
+```rust
+let handle = init_obs();
+let state = AppState { metrics_handle: handle.clone(), ..Default::default() };
+
+let metrics_router = Router::new().route("/metrics", get({
+    let h = handle.clone();
+    move || async move {
+        if let Some(h) = &h { (StatusCode::OK, h.render()) } else { (StatusCode::SERVICE_UNAVAILABLE, "") }
+    }
+}));
+```
+
+* * *
+
+### 11.2 Convenções de spans
+
+*   Span raiz por requisição: `gate.request`  
+    Atributos: `request_id`, `method`, `path`, `scope.app`, `scope.tenant`, `auth.sub`, `client_id`.
+*   Sub-spans:
+    *   `policy.decide` (uma por política; attrs: `policy_id`, `decision`)
+    *   `runtime.exec` (attrs: `runtime.cid`, `bytes_in/out`)
+    *   `ledger.put` / `ledger.get` (attrs: `cid`, `kind=receipt|transition`)
+    *   `event.publish` (attrs: `event_id`, `phase`, `partition_key`, `topic`)
+    *   `cors.check` (attrs: `origin`, `scope`, `allowed`)
+    *   `rate.check` (attrs: `key`, `burst`, `remaining`)
+    *   `idemp.check` (attrs: `key`, `result=New|Replay|InProgress|Expired|Evicted`)
+
+Exemplo no handler:
+
+```rust
+#[tracing::instrument(
+    name="gate.request",
+    skip(state, body),
+    fields(request_id=%req_id, method=%method, path=%path, app=%scope.app, tenant=%scope.tenant)
+)]
+async fn execute_runtime(State(state): State<AppState>, scope: Scope, body: Json<Manifest>) -> Result<Json<Receipt>, AppError> {
+    // ...
+    let _span = tracing::info_span!("runtime.exec", runtime_cid=%state.runtime_sha256).entered();
+    // chama runtime...
+}
+```
+
+Erros com contexto:
+
+```rust
+tracing::error!(error=%e, code=%code, "execute_failed");
+return Err(AppError::internal("runtime_error"));
+```
+
+* * *
+
+### 11.3 Métricas Prometheus
+
+**Contadores:**
+
+*   `gate_requests_total{method,route,app,tenant}`
+*   `gate_responses_total{status,route,app,tenant}`
+*   `gate_policy_decisions_total{policy_id,decision,app,tenant}`
+*   `gate_event_publish_total{result="ok|err",phase,app,tenant}`
+*   `gate_idempotency_total{result,app,tenant}`
+*   `gate_rate_limit_drops_total{app,tenant,client_id}`
+*   `gate_cors_origin_checks_total{result="allow|deny",scope,app,tenant}`
+*   `ledger_ops_total{op="put|get",kind,app,tenant}`
+
+**Histogramas:**
+
+*   `gate_request_duration_seconds{route,app,tenant}`
+*   `runtime_exec_seconds{pipeline}`
+*   `ledger_put_seconds{kind}`
+*   `event_publish_seconds{phase}`
+
+**Gauges:**
+
+*   `event_retry_queue_depth{app,tenant}`
+*   `idempotency_store_size`
+*   `rate_bucket_remaining{app,tenant,client_id}`
+
+Exemplo de uso:
+
+```rust
+use metrics::{counter, histogram, gauge};
+
+counter!("gate_requests_total", 1, "method"=>method, "route"=>route, "app"=>app, "tenant"=>tenant);
+let t0 = std::time::Instant::now();
+// ...processa...
+histogram!("gate_request_duration_seconds", t0.elapsed().as_secs_f64(), "route"=>route, "app"=>app, "tenant"=>tenant);
+```
+
+* * *
+
+### 11.4 Cabeçalhos de resposta
+
+Padronizar **RateLimit** e **Request-ID**:
+
+*   `X-Request-Id` (ecoado do middleware)
+*   `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `Retry-After` (quando aplicável)
+
+Liberar via CORS: `access-control-expose-headers: x-ratelimit-limit,x-ratelimit-remaining,retry-after,x-request-id`.
+
+* * *
+
+### 11.5 SLOs e alertas
+
+SLO iniciais (7 dias):
+
+*   **Disponibilidade API**: 99.9% de 2xx/3xx (exclui 4xx).
+*   **Latência p95 `/v1/execute`**: ≤ 250 ms.
+*   **Erro de publish**: < 1% por 5 min.
+
+Alertas Prometheus/Alertmanager:
+
+*   `sum by(app,tenant)(rate(gate_event_publish_total{result="err"}[5m])) > 0`
+*   `histogram_quantile(0.95, sum by (le)(rate(gate_request_duration_seconds_bucket{route="/v1/execute"}[5m]))) > 0.25`
+*   `sum by(app,tenant)(increase(gate_rate_limit_drops_total[5m])) > 100`
+
+* * *
+
+### 11.6 Dashboard mínimo (Grafana)
+
+**Painel 1 — Tráfego e Sucesso**
+
+*   `gate_requests_total` por rota
+*   % respostas 2xx/4xx/5xx empilhado
+*   p50/p95/p99 `gate_request_duration_seconds` (por rota)
+
+**Painel 2 — Pipeline**
+
+*   `runtime_exec_seconds` (p95) por pipeline
+*   `gate_policy_decisions_total{decision}` por policy
+*   `ledger_ops_total` (put/get) + `ledger_put_seconds` p95
+
+**Painel 3 — EventBus**
+
+*   `gate_event_publish_total{result}`
+*   `event_publish_seconds` p95
+*   `event_retry_queue_depth`
+
+**Painel 4 — Limiter/Idempotência/CORS**
+
+*   `gate_rate_limit_drops_total` por client\_id
+*   `gate_idempotency_total{result}`
+*   `gate_cors_origin_checks_total{result}`
+
+* * *
+
+### 11.7 Testes automatizados
+
+**Unit (sem rede):**
+
+*   Emissão de métricas por caminho feliz/erro (usa `metrics_util::debugging::DebuggingRecorder`).
+*   Spans carregam `app`, `tenant`, `request_id`.
+
+**Integração (supertest do Axum):**
+
+1.  `/healthz` → `gate_requests_total` incrementa e `/metrics` expõe.
+2.  `/v1/execute` PASS → incrementa `gate_policy_decisions_total{decision="PASS"}` e registra histograma > 0.
+3.  Rate limit breach → `gate_rate_limit_drops_total` > 0 e cabeçalhos `X-RateLimit-*`.
+4.  CORS `Origin` permitido/negado → `gate_cors_origin_checks_total{result=...}`.
+5.  Event publish erro simulado (bus `MemBus` que falha 1x) → `gate_event_publish_total{result="err"}` seguido de “ok”.
+
+**E2E (opcional):**
+
+*   Com Iggy/Prometheus reais em docker-compose; valida scrape e painéis.
+
+* * *
+
+### 11.8 Boas práticas
+
+*   **Amostragem de tracing**: produção com 10–20% em rotas quentes; 100% em erros.
+*   **PII**: nunca logar payload; logar **CIDs** e `request_id`.
+*   **Correlacionar**: propagar `request_id` em spans filhos e logs.
+*   **Backpressure**: não bloquear caminho de resposta por falhas de telemetria.
+
+* * *
+
+### 11.9 Entregáveis
+
+*   `obs.rs` (init de tracing + prometheus; helper para `X-Request-Id`).
+*   Middlewares: request-id, métricas de request, expose headers CORS.
+*   Instrumentação nos pontos: policy, runtime, ledger, eventbus, cors, limiter, idemp.
+*   `/metrics` route.
+*   Painel Grafana (JSON) e regras de alerta.
+*   Testes unit + integração cobrindo métricas/spans essenciais.
+
+* * *
+
+### 11.10 Resultado
+
+Com poucos arquivos e padrões claros, você ganha **visibilidade operacional real**: sabe **quanto**, **quão rápido** e **quão bem** cada fase está performando, detecta regressões, tem **SLOs acionáveis** e um dashboard que conversa diretamente com o seu modelo **receipt-first**.
+
+## Prompt:
+12
+
+## Response:
+Capítulo 12/12 — Receipt UI (Canvas) → Integração
+-------------------------------------------------
+
+Objetivo: ligar a **UI de Recibo** (canvas) ao **gate** real, mantendo o modo “Demo” quando não houver `cid`, suportando `b3:` em URLs, botões “Copy/Verify/Deep-link” funcionais, acessibilidade completa e impressão sóbria.
+
+* * *
+
+### 12.1 Contratos de API (versão estável)
+
+*   **GET** `/a/{app}/t/{tenant}/v1/receipt/{cid}`  
+    Retorna:
+    ```json
+    {
+      "decision": "PASS|RETRY|DENY",
+      "cid": "cid:b3:...",
+      "runtime": {"did": "did:key:..."},
+      "jws": {
+        "alg": "Ed25519",
+        "protected": {"kid":"did:key:..."},
+        "payload": "0x..."
+      },
+      "links": {
+        "self": "https://gate/a/{app}/t/{tenant}/v1/receipt/{cid}",
+        "verify": "https://gate/a/{app}/t/{tenant}/v1/verify/{cid}"
+      },
+      "policy_trace": [{ "id":"policy-xyz", "decision":"PASS|RETRY|DENY" }]
+    }
+    ```
+*   **Cabeçalhos**: `X-Request-Id`, `X-RateLimit-*`, `Retry-After` (expostos via CORS).
+*   **Erros (JSON)** via `AppError`:
+    ```json
+    {"code":"not_found","message":"receipt not found","request_id":"...","retry_after":0}
+    ```
+
+Observações:
+
+*   Não exigir `Content-Type` em **GET**.
+*   `cid` aceita `b3:` literal (também URL-encoded).
+
+* * *
+
+### 12.2 Protocolo de binding (UI → gate)
+
+1.  **Resolver escopo** da URL:
+    *   Query: `?cid=...&app=...&tenant=...`
+    *   Ou path “friendly”: `/#/a/{app}/t/{tenant}/cid/{cid}` (UI reescreve para fetch).
+2.  **Demo Mode**: quando faltar `cid`, usar objeto de amostra (o que já está no canvas) e exibir “Demo Mode”.
+3.  **Fetch**:
+    *   `Authorization: Bearer …` quando existir (UI pública pode omitir).
+    *   `Accept: application/json`.
+
+**Snippet (substitui o “demo data” do canvas com fallback elegante):**
+
+```html
+<script>
+async function loadReceipt() {
+  const qs = new URLSearchParams(location.search);
+  const app    = qs.get('app');
+  const tenant = qs.get('tenant');
+  const cid    = qs.get('cid');
+
+  // Demo Mode quando faltar cid/app/tenant
+  if (!cid || !app || !tenant) return { demo:true };
+
+  const base = location.origin; // ou env injetado na build
+  const url  = `${base}/a/${encodeURIComponent(app)}/t/${encodeURIComponent(tenant)}/v1/receipt/${encodeURIComponent(cid)}`;
+
+  const headers = { 'Accept':'application/json' };
+  const token = sessionStorage.getItem('ubl_token') || '';
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({message:res.statusText, code:String(res.status)}));
+    throw Object.assign(new Error(err.message||'Erro'), { code:err.code||String(res.status), requestId: res.headers.get('x-request-id') });
+  }
+  const body = await res.json();
+
+  // normalizar campos mínimos esperados pela UI
+  return {
+    demo:false,
+    decision: body.decision,
+    cid: body.cid,
+    jws: body.jws,
+    runtime: body.runtime,
+    links: body.links,
+    policy_trace: body.policy_trace || []
+  };
+}
+</script>
+```
+
+**Hook no canvas existente (troca o IIFE `(receipt)` por `await loadReceipt()`):**
+
+```html
+<script>
+(async function main(){
+  try {
+    const r = await loadReceipt();
+    // preencher demo badge
+    if (r.demo) document.getElementById('demoBadge').style.display='inline-flex';
+
+    // reaproveita bind() já existente
+    (function bind(receipt){
+      // ... (seu código atual de bind) ...
+    })(Object.assign({
+      decision:'PASS',
+      cid:'cid:b3:QmXYZ123…9v',
+      jws:{alg:'Ed25519', protected:{kid:'did:key:z6Mk…'}, payload:'0x82f…a1c9'},
+      links:{ self: location.origin + '/v1/receipts/cid:b3:QmXYZ123…9v', verify: location.origin + '/v1/verify/cid:b3:QmXYZ123…9v' },
+      runtime:{did:'did:key:z6Mk…'}
+    }, r.demo ? {} : r));
+  } catch (e) {
+    // Mostrar erro “confiável”
+    const pre = document.createElement('pre');
+    pre.className='mono card';
+    pre.textContent = `Falha ao carregar recibo\ncode=${e.code||'unknown'}\nrequest_id=${e.requestId||'-'}\nmsg=${e.message}`;
+    document.querySelector('.sheet').appendChild(pre);
+  }
+})();
+</script>
+```
+
+* * *
+
+### 12.3 Interações confiáveis
+
+*   **Copy/Deep-link/Verify**: já mapeados; “Verify” abre guia com instruções para `ublx verify {cid}` (incluir doc curta).
+*   **Explainers**: popovers (`.pop`) com ARIA e dismiss on click-outside já prontos.
+*   **Progress bar**: 33/66/100% conforme `decision`.
+*   **Print strip**: `footer#authStrip` aparece apenas no modo impressão.
+
+Adicionar **links de verificação**:
+
+```html
+<script>
+document.getElementById('doc-verify').addEventListener('click', (e)=>{
+  e.preventDefault();
+  const url = 'https://docs.seu-dominio/verify'; // doc curta com ublx/TS/Py
+  window.open(url,'_blank','noreferrer');
+});
+</script>
+```
+
+* * *
+
+### 12.4 Acessibilidade (checagem)
+
+*   `aria-live="polite"` nos toasts (já há `#live`).
+*   Toolbar com `role="toolbar"` e `aria-label`.
+*   Popovers com `aria-controls`, `aria-expanded`; fechar com `Esc`.
+*   Contraste e foco visíveis nos `.chip` (`aria-pressed` temporário).
+*   `prefers-reduced-motion` respeitado.
+
+* * *
+
+### 12.5 Telemetria de UI
+
+Enviar _beacons_ opcionais (sem PII) ao abrir/fechar popovers, copy/verify, impressão:
+
+```js
+function beacon(ev, extra={}) {
+  try { navigator.sendBeacon('/telemetry/ui', JSON.stringify({ev, t:Date.now(), ...extra})); } catch {}
+}
+```
+
+* * *
+
+### 12.6 Testes (UI)
+
+1.  **Unit (no browser com `vitest`/`uvu` ou leve IIFE como já existe):**
+    *   `copy()` retorna Promise.
+    *   Status aplicado ao `<body data-status>`.
+    *   Progress ≥ 33% e coerente com `decision`.
+    *   Popovers alternam `aria-expanded`.
+2.  **Integração (mock fetch):**
+    *   `b3:` literal e `%3A` funcionam.
+    *   Erro JSON do gate é renderizado com `request_id`.
+3.  **A11y (axe-core)**: sem violações críticas.
+4.  **Print**: snapshot visual (Playwright) com faixa de autenticidade visível.
+5.  **“Copy All”** inclui `links.self`.
+
+Exemplo de teste leve já embutido no canvas: mantenha e acrescente checagem de `links.self` copiado.
+
+* * *
+
+### 12.7 Segurança e CORS
+
+*   UI só consome **GET**; CORS deve permitir `GET`, `Authorization`, `X-Request-Id` e expor `x-ratelimit-*`, `retry-after`, `x-request-id`.
+*   Preflight: predicate resolve **scope** do caminho (`/a/{app}/t/{tenant}/…`), como você já ajustou no gate.
+
+* * *
+
+### 12.8 Deploy
+
+*   **No-cache** controlado (ex.: `Cache-Control: no-store` durante testes).
+*   **Env**: `GATE_BASE_URL`, `PUBLIC_DOC_VERIFY_URL`.  
+    Se ausente, usa `location.origin`.
+
+* * *
+
+### 12.9 Próximos incrementos
+
+*   **Policy Trace UI**: seção colapsável listando cada política, decisão e notas.
+*   **Diff WA→WF**: micro-viewer que mostra o que mudou.
+*   **Share Link** assinado: gerar deep-link com HMAC (expiração curta) quando necessário.
+*   **Tema claro/escuro** via `prefers-color-scheme`.
+
+* * *
+
+### 12.10 Resultado
+
+A página do canvas passa a operar **direto no recibo real** quando houver `cid/app/tenant`, cai em **Demo Mode** quando não houver, preserva **segurança de leitura**, comunica **provas** com clareza e imprime um **recibo sóbrio** com trilha de autenticidade — tudo coerente com o núcleo **receipt-first**.
+
+## Prompt:
+*Nao olha o canvas*
+
+Consegue ler as últimas 12 mensagens e ver se gostou?
+
+2/2
+
+## Response:
+Gostei muito — está coeso, incremental e com foco em prova/qualidade. Eis meu review das 12, com elogios e apertos onde dá para lapidar mais.
+
+### O que ficou excelente
+
+*   **Núcleo imutável + packs estáticos**: fecha a porta para drift e injecção dinâmica. Ótimo você atrelar `runtime.sha256`/`did` no recibo.
+*   **Scope first (app/tenant)** em CORS, rate limit, storage e rotas: alinhou tudo no mesmo eixo.
+*   **Idempotência** com chave `(app, tenant, method, path, idemp_key, body_sha)` e **seq monotônico**: resolve empate de `Instant`. Boa cobertura de testes.
+*   **Receipt API** “à prova de `b3:`” + `AppError` JSON estável: DX muito melhor; também acerta a UI e o battle.
+*   **Battle e2e**: força o caminho correto (user → app → tenant), cobre auth on, CORS 3 camadas, determinismo com `ghost:true`, auditoria antes/depois e isolamento.
+*   **CLI pública como contrato**: esse guard-rail evita descompasso de longo prazo e dá um roteiro claro de “alignment issues”.
+*   **EventBus plugável (Iggy)** com evento mínimo e partição por `app:tenant`: casa perfeito com projeções e produtos satélite.
+*   **Observabilidade** com spans e métricas nomeadas: dá material direto para SLOs.
+*   **UI do recibo**: interativa, explicativa, print sóbrio, e com caminho de “Demo → real” bem definido.
+
+### Onde eu apertaria mais (pequenos refinamentos)
+
+1.  **Chave de idempotência**  
+    Inclua `query_sha` (hash de querystring normalizada) e **versão do contrato** (`contract_rev`) para blindar futuros params ou mudanças de schema.
+2.  **Rate limit**  
+    Especifique explicitamente janelas (ex.: token bucket 60s) e **limites por método** (GET vs POST). Teste headers CORS expostos em **preflight** também.
+3.  **AppError**  
+    Mantenha enum estável de `code` (`invalid_cid`, `not_found`, `rate_limited`, `unauthorized`, `forbidden`, `idempotency_replay`) e **mapeamento 1:1** com HTTP status. Adicione `hint` opcional quando seguro.
+4.  **Receipts store**  
+    Confirme **chave dupla**: `scoped_cid` (oficial) e `cid puro` (legado) com TTL de migração. Teste “lookup por scoped” primeiro, depois fallback.
+5.  **Battle script**  
+    Adicione checks de **headers** (`X-RateLimit-*`, `X-Request-Id`, `Retry-After`), e um bloco de **reprocessamento at-least-once** consumindo o EventBus e validando idempotência do indexer.
+6.  **EventBus**  
+    Persistir `offset_cid` ou `event_id` no recibo WF (ou metadado) facilita auditorias de entrega. Teste “duplo publish” e “consumidor lento”.
+7.  **Tracing**  
+    Propague `request_id` como **trace id** raíz quando possível; inclua `cid` e `scope` como attributes em todas as spans.
+8.  **UI verify**  
+    Forneça snippet direto de `ublx verify {cid}` + equivalente TS/Py, e teste de acessibilidade (axe) como parte do CI da UI.
+9.  **SemVer/compat**  
+    Já que a CLI é “fonte da verdade”, publique uma **matrix de compat** (CLI x gate x runtime) e um teste que recuse CLI muito antiga com erro claro.
+10.  **Segurança**  
+    Garanta `Allow-Origin` **exato** (sem `*` com credenciais), `Vary: Origin`, e normalize `Origin`/`Host` em preflight para evitar bypass de wildcard intermediário.
+
+### Mini-ajustes de redação/ordem
+
+*   A sequência **6→7→8** está ótima; só reforce no 7 que **GET** nunca exige `Content-Type`, e documente os **exemplos b3:** com e sem `%3A`.
+*   No 10, deixe claro o **ponto de publicação**: “publish só **após** persistir (ledger) e antes de responder”, e que o consumidor deve ser **idempotente** por `cid`.
+
+### Pequenas pendências que eu fecharia já
+
+*   Teste de **preflight**: `OPTIONS /a/{app}/t/{tenant}/v1/execute` com `Origin` permitido e bloqueado, validando `Access-Control-*`.
+*   Teste de **impressão** da UI (snapshot Playwright) com a faixa de autenticidade.
+*   **Doc curta** “Alignment Issue Template” (os 3 campos que você descreveu) no repositório.
+
+No geral: está redondinho e pronto pra crescer, com excelente equilíbrio entre segurança, DX e auditabilidade. Se quiser, eu escrevo os testes extras de preflight e o snippet de verificação CLI/TS/Py para colar direto no docs.
+
+## Prompt:
+Faltou um pouco as minhas ideias né.. :(
+
+## Response:
+Thought for 4 seconds
+
+Verdade, Dan — eu deixei pouco do teu “sotaque” ali. Vamos encaixar as tuas ideias direto no plano, sem perder o que já está sólido. Aqui vai o ajuste cirúrgico por tópico, com frases prontas pra colar nas seções correspondentes:
+
+### Onboarding (Mensagens 2–4)
+
+*   **Ordem canônica: usuário → app → tenant.**  
+    “O sistema primeiro cria o **usuário**; imediatamente detecta que ele não pode interagir sem **app** e **tenant**. Entrar em um app/tenant depende da política do admin (livre ou convite).”
+*   **Convites por e-mail com token já autenticado.**  
+    “Se o usuário abrir o convite já logado, o aceite é 1-clique (sem re-digitar código, app\_id ou tenant\_id).”
+*   **Confirmação de e-mail (Cloudflare).**  
+    “Adicionar verificação via provedor do Cloudflare; até confirmar, escopo só permite leitura de perfil e aceite de convites.”
+
+### URL-first (Mensagens 3, 6 e 7)
+
+*   **Tudo é chip: CID/DID na URL carregam o contexto.**  
+    “As rotas **/{a}/{app}/{t}/{tenant}/v1/** são a fonte de verdade do escopo; **b3:** no `cid` é aceito cru ou URL-encoded; o **DID** do runtime é exibido e verificável.”
+*   **Sem exigir `Content-Type` em GET.**  
+    “`GET /v1/receipt/{cid}` nunca exige `Content-Type`; respostas padronizadas `AppError{code,message,request_id,retry_after}`.”
+
+### CLI-first (Mensagens 8 e 9)
+
+*   **UI e testes espelham a CLI pública.**  
+    “A **CLI pública** é o contrato; a UI só a orquestra. Se CLI-admin ↔ API divergirem, abrir ‘alignment issue’ com: contrato esperado, contrato atual, teste reprodutor.”
+*   **Onboarding via CLI, sem atalhos.**  
+    “Sempre: **user → app → tenant**. Evita tenants “órfãos” e mantém trilha de recibos do onboarding.”
+
+### “Draft → Oficial” pelo Gate (Mensagem 8 e 12)
+
+*   **Promoção de rascunho a oficial.**  
+    “No tenant profissional-individual, enviar um documento ‘rascunho’ pelo **gate** o transforma em **Oficial** quando passa pelo runtime e vira **Receipt WF**. Terceiros podem usar o mesmo pipeline no escopo deles, com suas políticas.”
+
+### CORS por escopo (Mensagem 6/8)
+
+*   **Três camadas: global → app → (app,tenant).**  
+    “Predicado resolve escopo pela **URL** (funciona em preflight). Cabeçalhos `X-RateLimit-*` expostos; testes de preflight cobrindo permitido/bloqueado.”
+
+### Rate limit e Idempotência (Mensagens 5 e 6)
+
+*   **Chaves alinhadas ao teu modelo.**  
+    “Idempotência: `(app,tenant,method,path,idemp_key,body_sha,query_sha,contract_rev)` com seq monotônico.  
+    Rate limit: `(app,tenant,client_id)` com janelas por método; expõe `X-RateLimit-*` e `Retry-After`.”
+
+### EventBus sem “Importar” (Mensagem 10)
+
+*   **Aparece no outro app automaticamente.**  
+    “Após persistir, publicar `ReceiptEvent{scope,phase,cid,parent,decision,ts}` em partição `app:tenant`. Os satélites projetam; nada de ‘Importar Dados’.”
+
+### Observabilidade que ensina confiança (Mensagem 11)
+
+*   **Explica a matemática no UI.**  
+    “Tooltips/poppers mostram **por que** PASS/RETRY/DENY, com links ‘Verificar’ (abre guia com `ublx verify {cid}` e exemplos TS/Py).”
+
+### UI do recibo (Mensagem 12)
+
+*   **Teu layout, tua largura, teu PASS gigante.**  
+    “Mantém o ‘PASS’ grande + selo ‘**UBL Certified Runtime by LogLine Trust**’. Demo Mode quando sem `cid`. ‘Copy All’ inclui `links.self`. Modo impressão com faixa de autenticidade.”
+
+* * *
+
+#### Textos prontos pra colar nas mensagens
+
+*   **Msg 2 (Arquitetura base)**  
+    “Todas as decisões e identidades são **URL-first**: `/{a}/{app}/{t}/{tenant}/…`. Cada artefato é um **chip** (CID/DID).”
+*   **Msg 3 (Rotas/Escopo)**  
+    “Escopo é extraído **somente** da URL; tokens não carregam escopo autoridade-wise, apenas identidade.”
+*   **Msg 5 (Idempotência)**  
+    “Inclui `query_sha` e `contract_rev` na chave para blindar evolução de contrato.”
+*   **Msg 6 (Rate limit)**  
+    “Token bucket por método com `X-RateLimit-*` sempre expostos em CORS; preflight cobre `Origin` exato e `Vary: Origin`.”
+*   **Msg 7 (Receipt API)**  
+    “`GET` nunca exige `Content-Type`; `b3:` cru e `%3A` são válidos; erros em `AppError` JSON estável.”
+*   **Msg 8 (Battle)**  
+    “Fluxo canônico **user → app → tenant** via CLI pública/admin; sem atalhos. Caso convite por e-mail com sessão ativa, aceite 1-clique.”
+*   **Msg 9 (CLI como contrato)**  
+    “UI e testes chamam a mesma operação da CLI. Divergência vira ‘alignment issue’ com reprodutor.”
+*   **Msg 10 (EventBus)**  
+    “Publica **após** persistir. Consumidores idempotentes por `cid`.”
+*   **Msg 12 (UI)**  
+    “Botões helper com feedback tátil/visual; ‘Verify’ pulsa a folha e abre guia. Impressão sóbria com faixa de autenticidade.”
+
+S
